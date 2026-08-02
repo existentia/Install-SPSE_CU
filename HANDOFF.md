@@ -72,7 +72,16 @@ header rather than bumping to 1.8 for each subsequent fix in this batch.
 
 ## 4. Testing already done (off-farm, macOS, everything stubbed)
 
-Harness lived in a scratchpad on the original machine and is **not in this repo** — see §7.
+The harness is committed under `tests/` and targets Windows PowerShell 5.1 on the server — re-run it
+after any change to the script. See `tests/README.md`.
+
+```powershell
+.\tests\Test-Logic.ps1
+.\tests\Test-Integration.ps1
+```
+
+It touches no real service and executes no installer; every service cmdlet is stubbed and the one
+`Process::Start` call is replaced with a fake. Scratch files go to `%TEMP%\spse-cu-tests`.
 
 - **Syntax**: `[Parser]::ParseFile` — clean.
 - **19 unit assertions**: functions extracted from the real file via the AST (not copies) and run
@@ -162,9 +171,14 @@ non-FileSystem provider (e.g. `HKLM:\`).
 
 - `.DS_Store` is covered by a **global** gitignore on the original machine, not a repo-level one. There
   is no `.gitignore` in this repo — worth adding if the server sees stray files.
-- The off-farm test harness (`test-logic.ps1`, `prelude.ps1`, `run-integration.ps1`) was **not committed**
-  and does not exist on the server. It drives the script through stubbed cmdlets and would need
-  `powershell.exe` substituted for `pwsh` to run on Windows. Recreating it is only worthwhile if the
-  script is changed substantially again.
+- The off-farm test harness is in `tests/` (`Test-Logic.ps1`, `Test-Integration.ps1`, `Stubs.ps1`).
+  It targets Windows PowerShell 5.1 and is Windows-only by design: `Test-Integration.ps1` spawns
+  `powershell.exe` per scenario.
+- **The harness has never been run on Windows.** All 46 assertions passed on macOS while it was still
+  cross-platform; it was then simplified to Windows-only, and the three Windows-specific pieces
+  (`powershell.exe` as the child shell, `-ExecutionPolicy Bypass`, and asserting the un-masked exit
+  code 17302) are written but unproven. If the first run on the server fails, suspect the harness
+  before the script under test — and note `Test-Logic.ps1` has no Windows-specific parts, so if that
+  one passes and `Test-Integration.ps1` does not, the fault is almost certainly in the harness plumbing.
 - Suggested commit convention for this batch: keep everything under version 1.7 and append to the 1.7
   block in the script header.
