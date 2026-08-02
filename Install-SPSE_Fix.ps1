@@ -40,6 +40,29 @@
             installation cannot leave the services stopped and disabled. Note that a forced termination
             of the PowerShell process itself (Task Manager, taskkill, closing the console window) cannot
             be intercepted - see "Recovering from a forced termination" below
+          - drop the hardcoded module import and the hardcoded cache port from the graceful distributed
+            cache shutdown. Stop-SPDistributedCacheServiceInstance -Graceful performs the shutdown and
+            the SharePointServer module which supplies it loads on demand, so the graceful path does not
+            have to be run from the SharePoint Management Shell
+          - check that the cmdlets the graceful path relies on are present before anything is stopped,
+            and run the whole graceful path inside its own try, so that a missing prerequisite falls
+            back to a plain service stop rather than aborting the installation
+          - bound every wait. WaitForStatus was called without a timeout, so a service which never
+            stopped or never started left the script hanging forever - and the only way out of a hang
+            is to kill the process, which is precisely the case the finally block cannot recover from.
+            All waits now use the TimeSpan overload, controlled by -ServiceTimeoutSeconds, and the
+            graceful cache shutdown passes the same value to -Timeout
+          - abandon the run if a service cannot be stopped, rather than patching around it. Installing
+            while a service still holds its file locks is the problem this script exists to avoid
+          - restore each service inside its own try, so that one service failing to come back cannot
+            abandon the restore of the others
+          - add -Force to skip the confirmation prompt, so that the script can be driven across a farm
+            without an operator at the console
+          - validate -CULocation as it is bound rather than after the script has started, and resolve a
+            relative path against the current file system location so that a current location on
+            another provider, such as HKLM:\, cannot silently produce a nonsense path
+          - BREAKING CHANGE: -ShouldGracefulStopDCache is now a switch. Call it as
+            -ShouldGracefulStopDCache where version 1.6 and earlier needed -ShouldGracefulStopDCache $true
 
    Exit Codes:
     The script returns the exit code of the patch installer so that the outcome can be evaluated by
@@ -63,21 +86,56 @@
 
 [CmdletBinding()]
 param (
+    ## validated as it is bound, so an unattended run fails immediately with a non zero exit code
+    ## instead of starting and then stopping. The resolution below is repeated in the body because a
+    ## validation attribute cannot assign the resolved value back to the parameter
     [Parameter(Mandatory=$true)]
+    [ValidateScript({
+        $resolved = $_
+
+        if (![System.IO.Path]::IsPathRooted($resolved))
+        {
+            $resolved = Join-Path (Get-Location -PSProvider FileSystem).ProviderPath $resolved
+        }
+
+        if ([System.IO.Path]::GetExtension($resolved) -ne ".exe")
+        {
+            throw "The SharePoint Server Subscription Edition update has to be an .exe, for example C:\temp\uber-subscription-kb5002560-fullfile-x64-glb.exe"
+        }
+
+        if (!(Test-Path -LiteralPath $resolved -PathType Leaf))
+        {
+            throw "The SharePoint Server Subscription Edition update was not found at $resolved"
+        }
+
+        $true
+    })]
     [string]$CULocation,
 
+    ## a switch, so the graceful shutdown is requested with -ShouldGracefulStopDCache. Version 1.6 and
+    ## earlier took a [bool] and had to be called with -ShouldGracefulStopDCache $true
     [Parameter(Mandatory=$false)]
-    [bool]$ShouldGracefulStopDCache = $false
+    [switch]$ShouldGracefulStopDCache,
+
+    ## how long to wait for a single service to stop or start, and for the graceful shutdown of the
+    ## distributed cache. Applies per service, not to the run as a whole
+    [Parameter(Mandatory=$false)]
+    [int]$ServiceTimeoutSeconds = 300,
+
+    ## skip the confirmation prompt so that the script can be driven across a farm without an operator
+    [Parameter(Mandatory=$false)]
+    [switch]$Force
 )
 
-# allow relative paths to work
-$CULocation = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($PWD, $CULocation))
-
-if (!$CULocation.ToLower().EndsWith(".exe") -or ![System.IO.File]::Exists($CULocation))
+## the base for a relative path is taken from Get-Location -PSProvider FileSystem rather than $PWD, so
+## that running with a current location on another provider - HKLM:\ for instance - cannot silently
+## produce a nonsense path
+if (![System.IO.Path]::IsPathRooted($CULocation))
 {
-    Write-Host -ForegroundColor Yellow "Please specify the path of the SharePoint Server Subscription Edition Update fix (e.g. C:\temp\uber-subscription-kb5002560-fullfile-x64-glb.exe)"
-    Exit 1
+    $CULocation = Join-Path (Get-Location -PSProvider FileSystem).ProviderPath $CULocation
 }
+
+$CULocation = [System.IO.Path]::GetFullPath($CULocation)
 
 # List of common patch installation errors
 $ErrorMap = @{
@@ -197,34 +255,129 @@ function Set-ServiceStartMode {
     }
 }
 
+function Wait-ForServiceStatus {
+    ## $Service is deliberately untyped so that the off-farm tests can pass a stub in place of a
+    ## ServiceController
+    param(
+        $Service,
+        [string]$Status,
+        [int]$TimeoutSeconds
+    )
+
+    ## the parameterless WaitForStatus overload waits forever. A service which never reaches the
+    ## requested status would hang the script with no way out other than killing the process - and a
+    ## forced kill is the one failure mode the finally block cannot recover from, leaving the services
+    ## stopped and disabled. The TimeSpan overload bounds the wait instead.
+    try
+    {
+        $Service.WaitForStatus($Status, [TimeSpan]::FromSeconds($TimeoutSeconds))
+        return $true
+    }
+    catch
+    {
+        ## a timeout is an expected outcome and is reported by returning false. PowerShell wraps an
+        ## exception thrown out of a method call in a MethodInvocationException, and a typed catch only
+        ## unwraps one level, so the whole chain is walked rather than relying on that. Anything which
+        ## is not a timeout is a genuine failure and is left to propagate
+        $exception = $_.Exception
+
+        while ($null -ne $exception)
+        {
+            if ($exception -is [System.ServiceProcess.TimeoutException])
+            {
+                return $false
+            }
+
+            $exception = $exception.InnerException
+        }
+
+        throw
+    }
+}
+
 function Stop-ServiceIfRunning {
-    param([PSCustomObject]$State)
+    param(
+        [PSCustomObject]$State,
+        [int]$TimeoutSeconds
+    )
 
     if (!$State.WasRunning) {
-        return
+        return $true
     }
 
     Write-Host "Stopping $($State.Name) service..."
     $State.Service.Stop()
-    $State.Service.WaitForStatus("Stopped")
+
+    if (Wait-ForServiceStatus -Service $State.Service -Status "Stopped" -TimeoutSeconds $TimeoutSeconds)
+    {
+        return $true
+    }
+
+    Write-Host -ForegroundColor Red "$($State.Name) did not stop within $TimeoutSeconds seconds."
+    return $false
+}
+
+function Test-DistributedCacheSupport {
+
+    ## every cmdlet used by the graceful path comes from the SharePointServer module. On Subscription
+    ## Edition that module is on PSModulePath and loads on demand, so nothing has to be imported and no
+    ## Add-PSSnapin is needed - the graceful path is not restricted to the SharePoint Management Shell.
+    ##
+    ## Add-SPDistributedCacheServiceInstance is checked even though it is only used after the patch: the
+    ## service instance must not be unprovisioned unless it can also be provisioned again afterwards.
+    ##
+    ## the list is a parameter purely so that the off-farm tests can exercise the missing-cmdlet path on
+    ## a machine where the real cmdlets are installed - the script itself always uses the default
+    param(
+        [string[]]$RequiredCmdlets = @(
+            "Use-SPCacheCluster"
+            "Get-SPCacheClusterHealth"
+            "Stop-SPDistributedCacheServiceInstance"
+            "Remove-SPDistributedCacheServiceInstance"
+            "Add-SPDistributedCacheServiceInstance"
+        )
+    )
+
+    foreach ($cmdlet in $RequiredCmdlets)
+    {
+        if (!(Get-Command $cmdlet -ErrorAction SilentlyContinue))
+        {
+            Write-Host -ForegroundColor Yellow "$cmdlet is not available on this server."
+            return $false
+        }
+    }
+
+    return $true
 }
 
 function Stop-DistributedCacheGracefully {
-    param([PSCustomObject]$State)
+    param(
+        [PSCustomObject]$State,
+        [int]$TimeoutSeconds = 300
+    )
 
     ## the output of the cmdlets below is sent straight to the host so that it does not end up
     ## in the return value of this function
 
-    ## NOTE: carried over unchanged from version 1.6 - the import order of the administration module
-    ##       and the missing Microsoft.SharePoint.PowerShell snap-in are addressed separately
-    Use-SPCacheCluster | Out-Host
-    Import-Module "C:\Program Files\Common Files\microsoft shared\Web Server Extensions\16\BIN\CacheModules\DistributedCacheAdministration\DistributedCacheAdministration" | Out-Host
-    Get-SPCacheClusterHealth | Out-Host
-
+    ## the whole graceful path runs inside this try, including the prerequisite check. A missing cmdlet
+    ## or an unreachable cache cluster therefore falls back to a plain stop of the service rather than
+    ## throwing out of this function and aborting the installation
     try
     {
+        if (!(Test-DistributedCacheSupport))
+        {
+            Write-Host -ForegroundColor Yellow "Will fallback to non graceful stop of the caching service."
+            return $false
+        }
+
+        Use-SPCacheCluster | Out-Host
+        Get-SPCacheClusterHealth | Out-Host
+
         Write-Host "Graceful stopping Cache Host..."
-        Stop-AFCacheHost -Graceful -ComputerName $env:COMPUTERNAME -CachePort 22233 | Out-Host
+
+        ## -Timeout bounds the handover of the cached data in the same way the WaitForStatus calls are
+        ## bounded. Without it a cluster which cannot move its data to another host blocks the run
+        Stop-SPDistributedCacheServiceInstance -Graceful -Timeout $TimeoutSeconds | Out-Host
         Remove-SPDistributedCacheServiceInstance | Out-Host
         return $true
     }
@@ -240,7 +393,8 @@ function Restore-ServiceState {
     param(
         [PSCustomObject[]]$ServiceStates,
         [bool]$GracefulDCache = $false,
-        [bool]$StartServices = $true
+        [bool]$StartServices = $true,
+        [int]$TimeoutSeconds = 300
     )
 
     ## the services are restarted in the reverse order to the order in which they were stopped
@@ -249,44 +403,62 @@ function Restore-ServiceState {
 
     foreach ($state in $reversedStates)
     {
-        ## the startup type has to be restored first, a service which is still disabled cannot be started.
-        ## restoring the startup type of a stopped service does not start it, so this is safe to do even
-        ## while an installation is still running
-        if ($state.StartModeChanged)
+        ## a failure restoring one service must not abandon the rest. This function runs from the
+        ## finally block and is the only thing standing between an interrupted run and a server left
+        ## with its services stopped and disabled, so it carries on and reports rather than throwing
+        try
         {
-            Write-Host "Restoring startup type of $($state.Name) to $($state.StartMode)..."
-            Set-ServiceStartMode -Name $state.Name -StartMode $state.StartMode -DelayedStart $state.DelayedStart
+            ## the startup type has to be restored first, a service which is still disabled cannot be started.
+            ## restoring the startup type of a stopped service does not start it, so this is safe to do even
+            ## while an installation is still running
+            if ($state.StartModeChanged)
+            {
+                Write-Host "Restoring startup type of $($state.Name) to $($state.StartMode)..."
+                Set-ServiceStartMode -Name $state.Name -StartMode $state.StartMode -DelayedStart $state.DelayedStart
 
-            ## clear the flag so that this function can safely be called more than once
-            $state.StartModeChanged = $false
+                ## clear the flag so that this function can safely be called more than once
+                $state.StartModeChanged = $false
+            }
+
+            if (!$StartServices)
+            {
+                continue
+            }
+
+            ## a service which was not running before the installation is deliberately left stopped
+            if (!$state.WasRunning)
+            {
+                continue
+            }
+
+            if ($state.Graceful -and $GracefulDCache)
+            {
+                Write-Host "Add SPDistributedCacheServiceInstance"
+                Add-SPDistributedCacheServiceInstance | Out-Host
+                continue
+            }
+
+            ## refresh the cached service object so that the status reflects the state after the installation
+            $state.Service.Refresh()
+
+            if ($state.Service.Status -ne "Running")
+            {
+                Write-Host "Start $($state.Name) service..."
+                $state.Service.Start()
+
+                ## the patch has already been applied by this point, so a service which is slow to come
+                ## back is reported and the remaining services are still restored
+                if (!(Wait-ForServiceStatus -Service $state.Service -Status "Running" -TimeoutSeconds $TimeoutSeconds))
+                {
+                    Write-Host -ForegroundColor Red "$($state.Name) did not reach the Running state within $TimeoutSeconds seconds. It may still be starting - check it manually."
+                }
+            }
         }
-
-        if (!$StartServices)
+        catch
         {
-            continue
-        }
-
-        ## a service which was not running before the installation is deliberately left stopped
-        if (!$state.WasRunning)
-        {
-            continue
-        }
-
-        if ($state.Graceful -and $GracefulDCache)
-        {
-            Write-Host "Add SPDistributedCacheServiceInstance"
-            Add-SPDistributedCacheServiceInstance | Out-Host
-            continue
-        }
-
-        ## refresh the cached service object so that the status reflects the state after the installation
-        $state.Service.Refresh()
-
-        if ($state.Service.Status -ne "Running")
-        {
-            Write-Host "Start $($state.Name) service..."
-            $state.Service.Start()
-            $state.Service.WaitForStatus("Running")
+            Write-Host -ForegroundColor Red "Restoring $($state.Name) failed:"
+            $_ | Out-Host
+            Write-Host -ForegroundColor Red "Continuing with the remaining services. $($state.Name) has to be checked manually."
         }
     }
 }
@@ -323,7 +495,15 @@ foreach ($state in $servicesToDisable)
 }
 
 Write-Host -ForegroundColor Yellow ""
-Read-Host "PRESS ENTER TO CONTINUE"
+
+if ($Force)
+{
+    Write-Host -ForegroundColor Yellow "-Force was specified, so the confirmation prompt is skipped."
+}
+else
+{
+    Read-Host "PRESS ENTER TO CONTINUE"
+}
 
 
 ## $installExitCode is only overwritten once the installer has actually reported a result, so an
@@ -343,7 +523,7 @@ try
         ## changed, because unprovisioning the service instance of a disabled service fails
         if ($useGracefulStop)
         {
-            if (!(Stop-DistributedCacheGracefully $state))
+            if (!(Stop-DistributedCacheGracefully -State $state -TimeoutSeconds $ServiceTimeoutSeconds))
             {
                 ## the graceful shutdown failed - fall back to simply stopping the service
                 $ShouldGracefulStopDCache = $false
@@ -367,7 +547,13 @@ try
 
         if (!$useGracefulStop)
         {
-            Stop-ServiceIfRunning $state
+            ## a service which will not stop must not be ignored. The installer would then run against a
+            ## service which still holds its file locks, which is the whole problem this script exists to
+            ## avoid, so the run is abandoned and the finally block puts the startup types back
+            if (!(Stop-ServiceIfRunning -State $state -TimeoutSeconds $ServiceTimeoutSeconds))
+            {
+                throw "$($state.Name) could not be stopped, so the installation has not been started."
+            }
         }
     }
 
@@ -452,7 +638,7 @@ finally
         Write-Host
     }
 
-    Restore-ServiceState -ServiceStates $ServiceStates -GracefulDCache $ShouldGracefulStopDCache -StartServices (!$installerStillRunning)
+    Restore-ServiceState -ServiceStates $ServiceStates -GracefulDCache $ShouldGracefulStopDCache -StartServices (!$installerStillRunning) -TimeoutSeconds $ServiceTimeoutSeconds
 
     Write-Host
     Write-Host -ForegroundColor Green "Service restart completed."

@@ -8,6 +8,10 @@
 #
 # Every service action is appended to $env:TESTLOG so the caller can assert on the exact sequence.
 
+## Get-Service is stubbed below, so the assembly it would normally pull in has to be loaded explicitly:
+## both the timeout thrown here and the typed catch in the script under test need the real type
+Add-Type -AssemblyName System.ServiceProcess
+
 function global:Log { param($m) Add-Content -Path $env:TESTLOG -Value $m }
 
 $global:Fake = @{}
@@ -17,8 +21,17 @@ function global:New-FakeService {
     $o = [PSCustomObject]@{ Name = $Name; Status = $Status }
     $o | Add-Member -MemberType ScriptMethod -Name Stop          -Value { Log "STOP $($this.Name)";  $this.Status = "Stopped" }
     $o | Add-Member -MemberType ScriptMethod -Name Start         -Value { Log "START $($this.Name)"; $this.Status = "Running" }
-    $o | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value { param($s) }
     $o | Add-Member -MemberType ScriptMethod -Name Refresh       -Value { }
+
+    ## the script always passes a TimeSpan as the second argument. $env:HANG_SERVICE names a service
+    ## which never reaches the requested status, standing in for a wedged service
+    $o | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {
+        param($Status, $Timeout)
+        if ($this.Name -eq $env:HANG_SERVICE) {
+            Log "TIMEOUT $($this.Name) waiting for $Status"
+            throw (New-Object System.ServiceProcess.TimeoutException "$($this.Name) did not reach $Status")
+        }
+    }
     $global:Fake[$Name] = [PSCustomObject]@{ Svc = $o; StartMode = $StartMode; Delayed = $Delayed }
 }
 
@@ -32,7 +45,26 @@ New-FakeService -Name "SPTraceV4" -Status "Running" -StartMode "Auto"
 New-FakeService -Name "SPAdminV4" -Status "Running" -StartMode "Auto"
 New-FakeService -Name "W3SVC"     -Status "Running" -StartMode "Auto" -Delayed $true
 New-FakeService -Name "OSearch16" -Status "Stopped" -StartMode "Manual"
-New-FakeService -Name "SPCache"   -Status "Stopped" -StartMode "Disabled"
+
+## the graceful path only engages for a running cache host, so that scenario needs a different SPCache
+if ($env:DCACHE_RUNNING -eq "1") {
+    New-FakeService -Name "SPCache" -Status "Running" -StartMode "Auto"
+} else {
+    New-FakeService -Name "SPCache" -Status "Stopped" -StartMode "Disabled"
+}
+
+## these run on a real SharePoint server, where the genuine cache cmdlets resolve and would act on the
+## live farm. Shadowing them is what keeps the graceful path safe to exercise here.
+function global:Use-SPCacheCluster { Log "DCACHE USECLUSTER" }
+function global:Get-SPCacheClusterHealth { Log "DCACHE HEALTH" }
+function global:Remove-SPDistributedCacheServiceInstance { Log "DCACHE REMOVE" }
+function global:Add-SPDistributedCacheServiceInstance { Log "DCACHE ADD" }
+
+function global:Stop-SPDistributedCacheServiceInstance {
+    [CmdletBinding()] param([switch]$Graceful, [switch]$Force, $Timeout, $Identity)
+    if ($env:SCENARIO -eq "dcachefail") { throw "the cache cluster is unreachable" }
+    Log "DCACHE STOP graceful=$Graceful timeout=$Timeout"
+}
 
 function global:Get-Service {
     [CmdletBinding()] param([Parameter(Position=0)]$Name)
@@ -58,7 +90,8 @@ function global:Set-ItemProperty {
     Log "REG $($Path.Split('\')[-1])\$Name = $Value"
 }
 
-function global:Read-Host { param([Parameter(Position=0)]$Prompt) return "" }
+## logged so that a run can assert whether the confirmation prompt was reached at all
+function global:Read-Host { param([Parameter(Position=0)]$Prompt) Log "PROMPT"; return "" }
 
 $global:SleepCount = 0
 function global:Start-Sleep {

@@ -104,18 +104,33 @@ Check "Boot drivers left alone"     $before $script:SetServiceCalls.Count
 Write-Host "`nStop-DistributedCacheGracefully (return value purity)"
 function Use-SPCacheCluster { "noise from Use-SPCacheCluster" }
 function Get-SPCacheClusterHealth { "noise from Get-SPCacheClusterHealth"; [PSCustomObject]@{ Health = "OK" } }
-function Import-Module { [CmdletBinding()] param([Parameter(Position=0)]$Name) "noise from Import-Module" }
-function Stop-AFCacheHost { [CmdletBinding()] param([switch]$Graceful, $ComputerName, $CachePort) "noise from Stop-AFCacheHost" }
+function Stop-SPDistributedCacheServiceInstance { [CmdletBinding()] param([switch]$Graceful, [switch]$Force, $Timeout, $Identity) "noise from Stop-SPDistributedCacheServiceInstance" }
 function Remove-SPDistributedCacheServiceInstance { "noise from Remove-SPDistributedCacheServiceInstance" }
+function Add-SPDistributedCacheServiceInstance { "noise from Add-SPDistributedCacheServiceInstance" }
 
 $result = Stop-DistributedCacheGracefully ([PSCustomObject]@{ Name = "SPCache" })
 Check "success returns exactly one value" 1     @($result).Count
 Check "success returns `$true"            $true  $result
 
-function Stop-AFCacheHost { [CmdletBinding()] param([switch]$Graceful, $ComputerName, $CachePort) throw "cache host unreachable" }
+function Stop-SPDistributedCacheServiceInstance { [CmdletBinding()] param([switch]$Graceful, [switch]$Force, $Timeout, $Identity) throw "cache host unreachable" }
 $result = Stop-DistributedCacheGracefully ([PSCustomObject]@{ Name = "SPCache" })
 Check "failure returns exactly one value" 1      @($result).Count
 Check "failure returns `$false"           $false  $result
+
+# ---- 3b. the graceful path checks its prerequisites --------------------------------------------
+Write-Host "`nTest-DistributedCacheSupport"
+
+## an explicit list is passed for the negative case because this test also runs on a real SharePoint
+## server, where Get-Command would find the genuine cmdlets no matter what the stubs do
+Check "all required cmdlets present -> true"  $true  (Test-DistributedCacheSupport)
+Check "a missing cmdlet -> false"             $false (Test-DistributedCacheSupport -RequiredCmdlets @("Get-Command", "Definitely-NotARealCmdlet"))
+
+## the cache is driven entirely through the SharePoint cmdlets, which need no module import
+$invoked = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true) |
+    ForEach-Object { $_.GetCommandName() })
+Check "only SharePoint cache cmdlets are used" 0      @($invoked | Where-Object { $_ -like "*-AF*" }).Count
+Check "the SharePoint graceful stop is used"   $true  ($invoked -contains "Stop-SPDistributedCacheServiceInstance")
+Check "no module import is needed"             $false ($invoked -contains "Import-Module")
 
 # ---- 4. stop / restart ordering ----------------------------------------------------------------
 Write-Host "`nStop and restart ordering"
@@ -133,6 +148,96 @@ $reversedStates = @($ServiceStates.Clone())
 Check "stop order preserved from upstream" "SPTimerV4,SPTraceV4,SPAdminV4,W3SVC,OSearch16,SPSearchHostController,SPCache" (($ServiceStates.Name) -join ',')
 Check "restart order is the exact reverse"  "SPCache,SPSearchHostController,OSearch16,W3SVC,SPAdminV4,SPTraceV4,SPTimerV4" (($reversedStates.Name) -join ',')
 Check "Clone did not mutate the original"   "SPTimerV4" $ServiceStates[0].Name
+
+# ---- 5. bounded waits ---------------------------------------------------------------------------
+Write-Host "`nWait-ForServiceStatus and Stop-ServiceIfRunning"
+
+## the real type has to be loaded for the typed catch inside Wait-ForServiceStatus to resolve. The
+## script gets that for free from Get-Service, which is stubbed out in here
+Add-Type -AssemblyName System.ServiceProcess
+
+function New-WaitStub {
+    param([bool]$TimesOut)
+
+    $o = [PSCustomObject]@{ Name = "Fake"; Status = "Running"; WaitArgs = $null; Stopped = $false; TimesOut = $TimesOut }
+    $o | Add-Member -MemberType ScriptMethod -Name Stop -Value { $this.Stopped = $true }
+    $o | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {
+        param($Status, $Timeout)
+        $this.WaitArgs = "$Status/$($Timeout.TotalSeconds)"
+        if ($this.TimesOut) { throw (New-Object System.ServiceProcess.TimeoutException "did not reach $Status") }
+    }
+    return $o
+}
+
+$svc = New-WaitStub -TimesOut $false
+Check "reaching the status returns true"        $true        (Wait-ForServiceStatus -Service $svc -Status "Stopped" -TimeoutSeconds 30)
+Check "the timeout is passed as a TimeSpan"     "Stopped/30" $svc.WaitArgs
+
+$svc = New-WaitStub -TimesOut $true
+Check "a timeout returns false, not an error"   $false       (Wait-ForServiceStatus -Service $svc -Status "Stopped" -TimeoutSeconds 5)
+
+## only a timeout may be turned into a false - a permissions failure or anything else has to surface
+$svc = [PSCustomObject]@{ Name = "Fake" }
+$svc | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value { param($Status, $Timeout) throw "access is denied" }
+$threw = $false
+try { Wait-ForServiceStatus -Service $svc -Status "Stopped" -TimeoutSeconds 5 | Out-Null } catch { $threw = $true }
+Check "a non-timeout error is not swallowed"    $true        $threw
+
+## a service which will not stop must be reported, never treated as stopped - the installer would then
+## run while the file locks are still held, which is the problem the script exists to solve
+$state = [PSCustomObject]@{ Name = "SPTimerV4"; WasRunning = $true; Service = (New-WaitStub -TimesOut $true) }
+Check "a service that will not stop -> false"   $false (Stop-ServiceIfRunning -State $state -TimeoutSeconds 5)
+
+$state = [PSCustomObject]@{ Name = "SPTimerV4"; WasRunning = $true; Service = (New-WaitStub -TimesOut $false) }
+Check "a service that stops -> true"            $true  (Stop-ServiceIfRunning -State $state -TimeoutSeconds 5)
+Check "and it really was stopped"               $true  $state.Service.Stopped
+
+$state = [PSCustomObject]@{ Name = "OSearch16"; WasRunning = $false; Service = (New-WaitStub -TimesOut $true) }
+Check "a service that was not running -> true"  $true  (Stop-ServiceIfRunning -State $state -TimeoutSeconds 5)
+Check "and it was never touched"                $false $state.Service.Stopped
+
+## guards against an unbounded wait being reintroduced: those can only be escaped by killing the
+## process, which is the one case the finally block cannot recover from
+$waitCalls = @($ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+    $args[0].Member.Value -eq "WaitForStatus" }, $true))
+Check "there is a WaitForStatus call to check"  $true ($waitCalls.Count -gt 0)
+Check "every WaitForStatus call is bounded"     0     @($waitCalls | Where-Object { $_.Arguments.Count -lt 2 }).Count
+
+# ---- 6. the parameter surface -------------------------------------------------------------------
+Write-Host "`nParameters"
+
+$declared = @{}
+foreach ($p in $ast.ParamBlock.Parameters) { $declared[$p.Name.VariablePath.UserPath] = $p }
+
+## a switch, so that the graceful shutdown reads -ShouldGracefulStopDCache rather than the
+## unidiomatic -ShouldGracefulStopDCache $true that 1.6 required
+Check "ShouldGracefulStopDCache is a switch" "SwitchParameter" $declared["ShouldGracefulStopDCache"].StaticType.Name
+Check "there is a Force switch"              "SwitchParameter" $declared["Force"].StaticType.Name
+Check "the timeout is an int"                "Int32"           $declared["ServiceTimeoutSeconds"].StaticType.Name
+
+## validating at bind time is what makes an unattended run fail immediately rather than start and stop
+$culocAttributes = @($declared["CULocation"].Attributes | ForEach-Object { $_.TypeName.Name })
+Check "CULocation is validated at bind time" $true ($culocAttributes -contains "ValidateScript")
+
+## the prompt has to be reachable only when -Force was not given, otherwise an unattended run blocks
+$readHostCalls = @($ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+    $args[0].GetCommandName() -eq "Read-Host" }, $true))
+Check "there is exactly one Read-Host"       1     $readHostCalls.Count
+
+$guarded = $false
+$parent = $readHostCalls[0].Parent
+while ($null -ne $parent)
+{
+    if ($parent -is [System.Management.Automation.Language.IfStatementAst] -and $parent.Extent.Text -match '\$Force')
+    {
+        $guarded = $true
+        break
+    }
+    $parent = $parent.Parent
+}
+Check "the prompt is guarded by -Force"      $true  $guarded
 
 Write-Host "`n$pass passed, $fail failed" -ForegroundColor $(if ($fail) { "Red" } else { "Green" })
 exit $fail
