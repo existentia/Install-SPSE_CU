@@ -1,21 +1,21 @@
-﻿<#
- This Sample Code is provided for the purpose of illustration only and is not intended to be used in a production environment.  
- THIS SAMPLE CODE AND ANY RELATED INFORMATION ARE PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESSED OR IMPLIED, 
- INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY AND/OR FITNESS FOR A PARTICULAR PURPOSE.  
- We grant you a nonexclusive, royalty-free right to use and modify the sample code and to reproduce and distribute the object 
- code form of the Sample Code, provided that you agree: 
-    (i)   to not use our name, logo, or trademarks to market your software product in which the sample code is embedded; 
-    (ii)  to include a valid copyright notice on your software product in which the sample code is embedded; and 
-    (iii) to indemnify, hold harmless, and defend us and our suppliers from and against any claims or lawsuits, including 
+<#
+ This Sample Code is provided for the purpose of illustration only and is not intended to be used in a production environment.
+ THIS SAMPLE CODE AND ANY RELATED INFORMATION ARE PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESSED OR IMPLIED,
+ INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY AND/OR FITNESS FOR A PARTICULAR PURPOSE.
+ We grant you a nonexclusive, royalty-free right to use and modify the sample code and to reproduce and distribute the object
+ code form of the Sample Code, provided that you agree:
+    (i)   to not use our name, logo, or trademarks to market your software product in which the sample code is embedded;
+    (ii)  to include a valid copyright notice on your software product in which the sample code is embedded; and
+    (iii) to indemnify, hold harmless, and defend us and our suppliers from and against any claims or lawsuits, including
           attorneys' fees, that arise or result from the use or distribution of the sample code.
- Please note: None of the conditions outlined in the disclaimer above will supercede the terms and conditions contained within 
+ Please note: None of the conditions outlined in the disclaimer above will supercede the terms and conditions contained within
               the Premier Customer Services Description.
 
 
-  SUMMARY: 
-    
+  SUMMARY:
+
    This script identifies and stops/restarts Services to reduce the patch install time for SharePoint Server Subscription Edition Cumlative Update.
-   As input parameter it takes the path to the SharePoint patch to be installed and 
+   As input parameter it takes the path to the SharePoint patch to be installed and
    whether a graceful shutdown of the distributed cache on the current server should be performed if the current machine hosts the distributed cache service
 
    Reference: https://blog.stefan-gossner.com/2024/03/08/solving-the-extended-install-time-for-spse-cus/
@@ -28,6 +28,34 @@
     1.4 - allow server relative paths
     1.5 - fix incorrect if condition for restarting OSearch16 service at the end of the script
     1.6 - add line break after fix installation has been initiated message for better readability of the output
+    1.7 - collected fixes:
+          - report durations of one hour or more correctly
+          - return the installer exit code to the caller so that failures can be detected by automation
+          - temporarily set the startup type of the affected services to Disabled while the patch is applied so
+            that neither the installer nor a Service Control Manager recovery action can restart them
+          - restore the startup type each service originally had and only restart the services which were
+            actually running before the script was started
+          - skip services which are not installed on the current server rather than reporting an error
+          - restore the startup types from a finally block so that a failed, cancelled or aborted
+            installation cannot leave the services stopped and disabled. Note that a forced termination
+            of the PowerShell process itself (Task Manager, taskkill, closing the console window) cannot
+            be intercepted - see "Recovering from a forced termination" below
+
+   Exit Codes:
+    The script returns the exit code of the patch installer so that the outcome can be evaluated by
+    automation. 0 indicates success. 17022 indicates that the installation succeeded but that a reboot
+    is required. Any other value indicates a failure - see the error table below for the known codes.
+    An exit code of 1 indicates that the patch path was not valid, or that the script was interrupted
+    before the installation completed.
+
+   Recovering from a forced termination:
+    If the PowerShell process is killed outright between the services being disabled and the
+    installation finishing, the affected services are left stopped and with a startup type of Disabled.
+    The script reports which services it disabled, and with which startup type, before it makes any
+    change - so the original values can be read back from the console output. To recover, wait for the
+    installation to finish, put the startup types back and start the services which this server's role
+    requires. Check the values against another server in the farm first: not every service is set to
+    Automatic on every role, so a blanket reset to Automatic is not necessarily correct.
 
 #>
 
@@ -48,12 +76,12 @@ $CULocation = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($PWD, $CUL
 if (!$CULocation.ToLower().EndsWith(".exe") -or ![System.IO.File]::Exists($CULocation))
 {
     Write-Host -ForegroundColor Yellow "Please specify the path of the SharePoint Server Subscription Edition Update fix (e.g. C:\temp\uber-subscription-kb5002560-fullfile-x64-glb.exe)"
-    Exit
+    Exit 1
 }
 
 # List of common patch installation errors
 $ErrorMap = @{
-  
+
     -1    = 'The installation of the patch failed.'
     17300 = 'An error has occurred during the installation of this fix.'
     17301 = 'The detection failed, this can be due to a corrupted installation database.'
@@ -69,6 +97,19 @@ $ErrorMap = @{
     17032 = 'Insufficient disk space to install the fix.'
 }
 
+# The services are stopped in the order listed below and restarted in the reverse order.
+# Graceful marks the service which hosts the distributed cache and which can optionally be shut
+# down through the AppFabric cmdlets instead of simply being stopped.
+$ServiceDefinitions = @(
+    @{ Name = "SPTimerV4"              ; Graceful = $false }
+    @{ Name = "SPTraceV4"              ; Graceful = $false }
+    @{ Name = "SPAdminV4"              ; Graceful = $false }
+    @{ Name = "W3SVC"                  ; Graceful = $false }
+    @{ Name = "OSearch16"              ; Graceful = $false }
+    @{ Name = "SPSearchHostController" ; Graceful = $false }
+    @{ Name = "SPCache"                ; Graceful = $true  }
+)
+
 function Get-ExitMessage {
     param($Code)
 
@@ -79,258 +120,343 @@ function Get-ExitMessage {
     return "An Error has occurred during the installation. (ExitCode: $Code)"
 }
 
+function Format-Duration {
+    param([TimeSpan]$Duration)
 
-$MachineName = $env:COMPUTERNAME
+    ## the Minutes property only holds the minutes component of the duration and wraps at 60
+    ## use the total value so that installations taking an hour or more are reported correctly
 
-$srvSPTimerv4 = Get-Service "SPTimerV4"
-$srvSPTraceV4 = Get-Service "SPTraceV4"
-$srvSPAdminV4 = Get-Service "SPAdminV4"
+    if ($Duration.TotalHours -ge 1) {
+        return "{0} Hours, {1} Minutes, {2} Seconds" -f [Math]::Floor($Duration.TotalHours), $Duration.Minutes, $Duration.Seconds
+    }
 
-$srvw3svc = Get-Service "w3svc"
+    return "{0} Minutes, {1} Seconds" -f [Math]::Floor($Duration.TotalMinutes), $Duration.Seconds
+}
 
-$srvOSearch16 = Get-Service "OSearch16"
-$srvSPSearchHostController = Get-Service "SPSearchHostController"
+function Get-ServiceState {
+    param([hashtable]$Definition)
 
-$srvSPCache = Get-Service "SPCache"
+    ## a server only runs the services which match its role, so a service which is not installed
+    ## on the current machine is skipped rather than being reported as an error
+    $service = Get-Service $Definition.Name -ErrorAction SilentlyContinue
 
-$restartOSearch16 = $false
-$restartSPSearchHostController = $false
-$restartDCache = $false
+    if ($null -eq $service) {
+        return $null
+    }
+
+    ## Win32_Service is used in preference to the StartType property of the service object because
+    ## it also reports whether an automatic service is configured for delayed start
+    $config = Get-CimInstance -ClassName Win32_Service -Filter "Name='$($Definition.Name)'" -ErrorAction SilentlyContinue
+
+    $startMode = $null
+    $delayedStart = $false
+
+    if ($null -ne $config) {
+        $startMode = $config.StartMode
+        $delayedStart = [bool]$config.DelayedAutoStart
+    }
+
+    return [PSCustomObject]@{
+        Name             = $Definition.Name
+        Graceful         = $Definition.Graceful
+        Service          = $service
+        WasRunning       = ($service.Status -eq "Running")
+        StartMode        = $startMode
+        DelayedStart     = $delayedStart
+        StartModeChanged = $false
+    }
+}
+
+function Set-ServiceStartMode {
+    param(
+        [string]$Name,
+        [string]$StartMode,
+        [bool]$DelayedStart = $false
+    )
+
+    ## Win32_Service reports the mode of an automatic service as "Auto" while Set-Service expects "Automatic"
+    $startupType = switch ($StartMode) {
+        "Auto"     { "Automatic" }
+        "Manual"   { "Manual" }
+        "Disabled" { "Disabled" }
+        default    { $null }
+    }
+
+    if ($null -eq $startupType) {
+        ## boot and system start drivers are never touched by this script
+        return
+    }
+
+    Set-Service -Name $Name -StartupType $startupType
+
+    ## Set-Service cannot express "Automatic (Delayed Start)" so that flag has to be restored directly
+    if ($startupType -eq "Automatic") {
+        $delayedValue = 0
+        if ($DelayedStart) { $delayedValue = 1 }
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name "DelayedAutostart" -Value $delayedValue -Type DWord -ErrorAction SilentlyContinue
+    }
+}
+
+function Stop-ServiceIfRunning {
+    param([PSCustomObject]$State)
+
+    if (!$State.WasRunning) {
+        return
+    }
+
+    Write-Host "Stopping $($State.Name) service..."
+    $State.Service.Stop()
+    $State.Service.WaitForStatus("Stopped")
+}
+
+function Stop-DistributedCacheGracefully {
+    param([PSCustomObject]$State)
+
+    ## the output of the cmdlets below is sent straight to the host so that it does not end up
+    ## in the return value of this function
+
+    ## NOTE: carried over unchanged from version 1.6 - the import order of the administration module
+    ##       and the missing Microsoft.SharePoint.PowerShell snap-in are addressed separately
+    Use-SPCacheCluster | Out-Host
+    Import-Module "C:\Program Files\Common Files\microsoft shared\Web Server Extensions\16\BIN\CacheModules\DistributedCacheAdministration\DistributedCacheAdministration" | Out-Host
+    Get-SPCacheClusterHealth | Out-Host
+
+    try
+    {
+        Write-Host "Graceful stopping Cache Host..."
+        Stop-AFCacheHost -Graceful -ComputerName $env:COMPUTERNAME -CachePort 22233 | Out-Host
+        Remove-SPDistributedCacheServiceInstance | Out-Host
+        return $true
+    }
+    catch
+    {
+        $_ | Out-Host
+        Write-Host -ForegroundColor Yellow "Graceful stopping of Cache Host failed. Will fallback to non graceful stop of the caching service."
+        return $false
+    }
+}
+
+function Restore-ServiceState {
+    param(
+        [PSCustomObject[]]$ServiceStates,
+        [bool]$GracefulDCache = $false,
+        [bool]$StartServices = $true
+    )
+
+    ## the services are restarted in the reverse order to the order in which they were stopped
+    $reversedStates = @($ServiceStates.Clone())
+    [array]::Reverse($reversedStates)
+
+    foreach ($state in $reversedStates)
+    {
+        ## the startup type has to be restored first, a service which is still disabled cannot be started.
+        ## restoring the startup type of a stopped service does not start it, so this is safe to do even
+        ## while an installation is still running
+        if ($state.StartModeChanged)
+        {
+            Write-Host "Restoring startup type of $($state.Name) to $($state.StartMode)..."
+            Set-ServiceStartMode -Name $state.Name -StartMode $state.StartMode -DelayedStart $state.DelayedStart
+
+            ## clear the flag so that this function can safely be called more than once
+            $state.StartModeChanged = $false
+        }
+
+        if (!$StartServices)
+        {
+            continue
+        }
+
+        ## a service which was not running before the installation is deliberately left stopped
+        if (!$state.WasRunning)
+        {
+            continue
+        }
+
+        if ($state.Graceful -and $GracefulDCache)
+        {
+            Write-Host "Add SPDistributedCacheServiceInstance"
+            Add-SPDistributedCacheServiceInstance | Out-Host
+            continue
+        }
+
+        ## refresh the cached service object so that the status reflects the state after the installation
+        $state.Service.Refresh()
+
+        if ($state.Service.Status -ne "Running")
+        {
+            Write-Host "Start $($state.Name) service..."
+            $state.Service.Start()
+            $state.Service.WaitForStatus("Running")
+        }
+    }
+}
+
+
+# collect the current state of every service so that it can be put back exactly as it was found
+$ServiceStates = @()
+
+foreach ($definition in $ServiceDefinitions)
+{
+    $state = Get-ServiceState $definition
+
+    if ($null -ne $state)
+    {
+        $ServiceStates += $state
+    }
+}
+
+$servicesToStop = @($ServiceStates | Where-Object { $_.WasRunning })
+$servicesToDisable = @($ServiceStates | Where-Object { $null -ne $_.StartMode -and $_.StartMode -ne "Disabled" })
 
 Write-Host -ForegroundColor Yellow "Warning: This script will stop the following services before applying the fix:"
-if ($srvSPTimerv4.Status -eq "Running")
+foreach ($state in $servicesToStop)
 {
-    Write-Host -ForegroundColor Yellow "- SPTimerV4"
+    Write-Host -ForegroundColor Yellow "- $($state.Name)"
 }
-if ($srvSPTraceV4.Status -eq "Running")
+
+Write-Host -ForegroundColor Yellow ""
+Write-Host -ForegroundColor Yellow "The startup type of the following services will be set to Disabled for the duration of the"
+Write-Host -ForegroundColor Yellow "installation and restored to its current value afterwards:"
+foreach ($state in $servicesToDisable)
 {
-    Write-Host -ForegroundColor Yellow "- SPTraceV4"
-}
-if ($srvSPAdminV4.Status -eq "Running")
-{
-    Write-Host -ForegroundColor Yellow "- SPAdminV4"
-}
-if ($srvw3svc.Status -eq "Running")
-{
-    Write-Host -ForegroundColor Yellow "- W3SVC"
-}
-if ($srvOSearch16.Status -eq "Running")
-{
-    Write-Host -ForegroundColor Yellow "- OSearch16"
-}
-if ($srvSPSearchHostController.Status -eq "Running")
-{
-    Write-Host -ForegroundColor Yellow "- SPSearchHostController"
-}
-if ($srvSPCache.Status -eq "Running")
-{
-    Write-Host -ForegroundColor Yellow "- SPCache "
+    Write-Host -ForegroundColor Yellow "- $($state.Name) (currently $($state.StartMode))"
 }
 
 Write-Host -ForegroundColor Yellow ""
 Read-Host "PRESS ENTER TO CONTINUE"
 
 
-if ($srvSPTimerv4.Status -eq "Running")
-{
-    Write-Host "Stopping SPTimerV4 service..."
-    $srvSPTimerv4.Stop()
-    $srvSPTimerv4.WaitForStatus("Stopped")
-}
+## $installExitCode is only overwritten once the installer has actually reported a result, so an
+## interrupted or failed run is reported to the caller as a failure
+$installExitCode = 1
+$Process = $null
 
-if ($srvSPTraceV4.Status -eq "Running")
+## everything which changes the state of the machine runs inside this try/finally so that the startup
+## types are put back even if the script is interrupted or the installation throws
+try
 {
-    Write-Host "Stopping SPTraceV4 service..."
-    $srvSPTraceV4.Stop()
-    $srvSPTraceV4.WaitForStatus("Stopped")
-}
-
-if ($srvSPAdminV4.Status -eq "Running")
-{
-    Write-Host "Stopping SPAdminV4 service..."
-    $srvSPAdminV4.Stop()
-    $srvSPAdminV4.WaitForStatus("Stopped")
-}
-
-if ($srvw3svc.Status -eq "Running")
-{
-    Write-Host "Stopping W3SVC service..."
-    $srvw3svc.Stop()
-    $srvw3svc.WaitForStatus("Stopped")
-}
-
-if ($srvOSearch16.Status -eq "Running")
-{
-    $restartOSearch16 = $true
-    Write-Host "Stopping OSearch16 service..."
-    $srvOSearch16.Stop()
-    $srvOSearch16.WaitForStatus("Stopped")
-}
-
-if ($srvSPSearchHostController.Status -eq "Running")
-{
-    $restartSPSearchHostController = $true
-    Write-Host "Stopping SPSearchHostController service..."
-    $srvSPSearchHostController.Stop()
-    $srvSPSearchHostController.WaitForStatus("Stopped")
-}
-
-if ($srvSPCache.Status -eq "Running")
-{
-    $restartDCache = $true
-    if ($ShouldGracefulStopDCache)
+    foreach ($state in $ServiceStates)
     {
-        Use-SPCacheCluster
-        import-module "C:\Program Files\Common Files\microsoft shared\Web Server Extensions\16\BIN\CacheModules\DistributedCacheAdministration\DistributedCacheAdministration"
-        get-spcacheclusterhealth
-        try
+        $useGracefulStop = ($state.Graceful -and $state.WasRunning -and $ShouldGracefulStopDCache)
+
+        ## the distributed cache is shut down through the SharePoint cmdlets before its startup type is
+        ## changed, because unprovisioning the service instance of a disabled service fails
+        if ($useGracefulStop)
         {
-            Write-Host "Graceful stopping Cache Host..."
-            stop-afcachehost -graceful -computername $MachineName -CachePort 22233
-            Remove-SPDistributedCacheServiceInstance
+            if (!(Stop-DistributedCacheGracefully $state))
+            {
+                ## the graceful shutdown failed - fall back to simply stopping the service
+                $ShouldGracefulStopDCache = $false
+                $useGracefulStop = $false
+            }
         }
-        catch 
+
+        ## disabling the service stops the installer and any Service Control Manager recovery action from
+        ## restarting it while the patch is being applied. This happens before the service is stopped so
+        ## that there is no window in which a recovery action can bring it back up.
+        if ($null -eq $state.StartMode)
         {
-            $_
-            Write-Host -ForegroundColor Yellow "Graceful stopping of Cache Host failed. Will fallback to non graceful stop of the caching service."
-            # graceful failed fallback to stopping the caching service
-            $ShouldGracefulStopDCache = $false
-            Write-Host "Stopping SPCache service..."
-            $srvSPCache.Stop()
-            $srvSPCache.WaitForStatus("Stopped")
+            Write-Host -ForegroundColor Yellow "The startup type of $($state.Name) could not be determined and will be left unchanged."
         }
+        elseif ($state.StartMode -ne "Disabled")
+        {
+            Write-Host "Setting startup type of $($state.Name) to Disabled..."
+            Set-ServiceStartMode -Name $state.Name -StartMode "Disabled"
+            $state.StartModeChanged = $true
+        }
+
+        if (!$useGracefulStop)
+        {
+            Stop-ServiceIfRunning $state
+        }
+    }
+
+    Write-Host
+    Write-Host -ForegroundColor Green "All relevant Services have been stopped."
+    Write-Host -ForegroundColor Green "The SharePoint CU will now be applied..."
+
+    $startTime = Get-Date
+
+    $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $pInfo.FileName = $CULocation
+    $pInfo.Arguments = "/passive"
+
+    $Process = [Diagnostics.Process]::Start($pInfo)
+
+    $afterLaunchTime = Get-Date
+
+    $delta = $afterLaunchTime - $startTime
+
+    Write-Host
+    Write-Host "Fix installation has been initiated. Waiting for completion..."
+    Write-Host -ForegroundColor Green "Time taken to launch installer: $(Format-Duration $delta)"
+
+    while (!$Process.HasExited)
+    {
+        Start-Sleep -seconds 1
+    }
+
+    ## we cannot use $Process.WaitForExit as it does not work reliably.
+    ## In my tests it did not return even after the process ended in several tests
+    ## Need to loop and check HasExited instead
+
+    $endTime = Get-Date
+
+    $delta = $endTime - $afterLaunchTime
+
+    # capture the exit code so that it can be returned to the caller once the services have been restarted
+    $installExitCode = $Process.ExitCode
+
+    # check if the installation succeeded and report back
+    if ($installExitCode -eq 0)
+    {
+        Write-Host
+        Write-Host -ForegroundColor Green "Fix installation completed."
+        Write-Host -ForegroundColor Green "Time taken to install fix: $(Format-Duration $delta)"
+        Write-Host
+    }
+    elseif ($installExitCode -eq 17022)
+    {
+        Write-Host
+        Write-Host -ForegroundColor Yellow "Fix installation completed, but a reboot is required to complete the installation.`nPlease reboot the server as soon as possible.`n"
+        Write-Host -ForegroundColor Yellow "Time taken to install fix: $(Format-Duration $delta)"
+        Write-Host
     }
     else
     {
-        Write-Host "Stopping SPCache service..."
-        $srvSPCache.Stop()
-        $srvSPCache.WaitForStatus("Stopped")
+        Write-Host
+        Write-Host -ForegroundColor Red $(Get-ExitMessage $installExitCode)
+        Write-Host
     }
 }
-
-Write-Host 
-Write-Host -ForegroundColor Green "All relevant Services have been stopped."
-Write-Host -ForegroundColor Green "The SharePoint CU will now be applied..."
-
-$startTime = Get-Date
-
-$pInfo = New-Object System.Diagnostics.ProcessStartInfo
-$pInfo.FileName = $CULocation
-$pInfo.Arguments = "/passive"
-
-$Process = [Diagnostics.Process]::Start($pInfo) 
-
-$afterLaunchTime = Get-Date
-
-$delta = $afterLaunchTime - $startTime
-
-Write-Host 
-Write-Host "Fix installation has been initiated. Waiting for completion..."
-Write-Host -ForegroundColor Green "Time taken to launch installer: " $delta.Minutes "Minutes," $delta.Seconds "Seconds"
-
-while (!$Process.HasExited)
+catch
 {
-    Start-Sleep -seconds 1
-}
-
-## we cannot use $Process.WaitForExit as it does not work reliably. 
-## In my tests it did not return even after the process ended in several tests
-## Need to loop and check HasExited instead
-
-$endTime = Get-Date
-
-$delta = $endTime - $afterLaunchTime
-
-# check if the installation succeeded and report back
-if ($Process.ExitCode -eq 0)
-{
-    Write-Host 
-    Write-Host -ForegroundColor Green "Fix installation completed."
-    Write-Host -ForegroundColor Green "Time taken to install fix: " $delta.Minutes "Minutes," $delta.Seconds "Seconds"
+    Write-Host
+    Write-Host -ForegroundColor Red "The installation was not completed because of an unexpected error:"
+    $_ | Out-Host
     Write-Host
 }
-elseif ($Process.ExitCode -eq 17022)
+finally
 {
-    Write-Host 
-    Write-Host -ForegroundColor Yellow "Fix installation completed, but a reboot is required to complete the installation.`nPlease reboot the server as soon as possible.`n"
-    Write-Host -ForegroundColor Yellow "Time taken to install fix: " $delta.Minutes "Minutes," $delta.Seconds "Seconds"
-    Write-Host
-}
-else
-{
-    Write-Host 
-    Write-Host -ForegroundColor Red $(Get-ExitMessage $Process.ExitCode)
-    Write-Host
-}
+    ## if the script was interrupted while the installer was still running then the services must not be
+    ## started again - doing so would put the file locks back while the patch is still being applied
+    $installerStillRunning = ($null -ne $Process -and !$Process.HasExited)
 
-# get services again to get current status
-$srvSPTimerv4 = Get-Service "SPTimerV4"
-$srvSPTraceV4 = Get-Service "SPTraceV4"
-$srvSPAdminV4 = Get-Service "SPAdminV4"
-
-$srvw3svc = Get-Service "w3svc"
-
-$srvOSearch16 = Get-Service "OSearch16"
-$srvSPSearchHostController = Get-Service "SPSearchHostController"
-
-$srvSPCache = Get-Service "SPCache"
-
-if ($srvSPCache.Status -ne "Running" -and $restartDCache)
-{
-    if ($ShouldGracefulStopDCache)
+    if ($installerStillRunning)
     {
-        Write-Host "Add SPDistributedCacheServiceInstance"
-        Add-SPDistributedCacheServiceInstance
+        Write-Host
+        Write-Host -ForegroundColor Red "The script was interrupted while the installation was still running."
+        Write-Host -ForegroundColor Red "The startup types will be restored but the services will NOT be started, because"
+        Write-Host -ForegroundColor Red "starting them now would interfere with the installation which is still in progress."
+        Write-Host -ForegroundColor Red "Start them manually once the installation has finished, or reboot the server."
+        Write-Host
     }
-    else
-    {
-        Write-Host "Start SPCache service..."
-        $srvSPCache.Start()
-        $srvSPCache.WaitForStatus("Running")
-    }
+
+    Restore-ServiceState -ServiceStates $ServiceStates -GracefulDCache $ShouldGracefulStopDCache -StartServices (!$installerStillRunning)
+
+    Write-Host
+    Write-Host -ForegroundColor Green "Service restart completed."
 }
 
-if ($srvSPSearchHostController.Status -ne "Running" -and $restartSPSearchHostController)
-{
-    Write-Host "Start SPSearchHostController service..."
-    $srvSPSearchHostController.Start()
-    $srvSPSearchHostController.WaitForStatus("Running")
-}
-
-if ($srvOSearch16.Status -ne "Running" -and $restartOSearch16)
-{
-    Write-Host "Start OSearch16 service..."
-    $srvOSearch16.Start()
-    $srvOSearch16.WaitForStatus("Running")
-}
-
-if ($srvw3svc.Status -ne "Running")
-{
-    Write-Host "Start W3SVC service..."
-    $srvw3svc.Start()
-    $srvw3svc.WaitForStatus("Running")
-}
-
-if ($srvSPAdminV4.Status -ne "Running")
-{
-    Write-Host "Start SPAdminV4 service..."
-    $srvSPAdminV4.Start()
-    $srvSPAdminV4.WaitForStatus("Running")
-}
-
-if ($srvSPTraceV4.Status -ne "Running")
-{
-    Write-Host "Start SPTraceV4 service..."
-    $srvSPTraceV4.Start()
-    $srvSPTraceV4.WaitForStatus("Running")
-}
-
-if ($srvSPTimerv4.Status -ne "Running")
-{
-    Write-Host "Start SPTimerv4 service..."
-    $srvSPTimerv4.Start()
-    $srvSPTimerv4.WaitForStatus("Running")
-}
-
-Write-Host 
-Write-Host -ForegroundColor Green "Service restart completed."
+# return the result of the patch installation to the caller so that failures can be detected by automation
+Exit $installExitCode
