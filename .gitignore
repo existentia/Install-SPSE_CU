@@ -1,0 +1,10 @@
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# machine-local Claude Code settings (settings.json is shared, settings.local.json is not)
+.claude/settings.local.json
+
+# transcripts, if a run is logged from inside the repo rather than C:\temp
+*.log
