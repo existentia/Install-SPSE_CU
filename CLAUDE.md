@@ -10,10 +10,13 @@ the install time of a SharePoint Server Subscription Edition cumulative update b
 SharePoint/IIS services that hold file locks, applying the CU, then putting everything back.
 Rationale: <https://blog.stefan-gossner.com/2024/03/08/solving-the-extended-install-time-for-spse-cus/>
 
-`HANDOFF.md` is the authoritative running record: what changed in v1.7, why, what has and has not
-been tested, and the queue of pending fixes (numbered — #2 DCache module import order, #4
-`WaitForStatus` timeouts, #6 unattended execution, #8 README). **Read it before changing the script,
-and update it after.**
+The script is at **version 1.7**, which is what its comment header documents. `README.md` covers
+purpose, usage, parameters and exit codes; `tests/README.md` covers what the tests do and — more
+importantly — what has and has not been verified, including against a real CU on a real farm.
+
+There is no separate backlog: the v1.7 batch is complete and the handover document that tracked it
+has been retired. Untested paths are listed under "Still never tested anywhere" in
+`tests/README.md`.
 
 ## Commands
 
@@ -86,4 +89,5 @@ Invariants that are easy to break — preserve them:
 - Behaviour carried over unchanged from upstream that is known to be wrong is marked with a `NOTE:`
   comment rather than silently fixed, so untestable changes don't ride along with refactors.
 - Off-farm tests cannot cover `Set-Service`, the registry write, the AppFabric/SharePoint cmdlets, a
-  real patch install, or a real Ctrl-C. The on-server checklist for those is §5 of `HANDOFF.md`.
+  real patch install, or a real Ctrl-C. What that leaves unverified is listed under "Still never
+  tested anywhere" in `tests/README.md` — read it before assuming a path is safe.

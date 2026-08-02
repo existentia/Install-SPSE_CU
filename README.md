@@ -9,7 +9,12 @@ shorter one. The reasoning is Stefan Goßner's:
 <https://blog.stefan-gossner.com/2024/03/08/solving-the-extended-install-time-for-spse-cus/>
 
 This is a fork of [Stefan Goßner's original](https://github.com/stefangossner/Install-SPSE_Fix),
-carrying additional fixes — see [Version 1.7](#version-17) below.
+carrying additional fixes — see [Version 1.7](#version-17) below. Upstream was last matched at 1.6. To
+diff against it:
+
+```powershell
+git remote add upstream https://github.com/stefangossner/Install-SPSE_Fix.git
+```
 
 ## Requirements
 

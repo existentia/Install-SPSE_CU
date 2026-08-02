@@ -69,4 +69,52 @@ graceful path engages.
 
 These cannot exercise `Set-Service`, the registry write, the SharePoint cache cmdlets, or a real
 patch installation — all are stubbed. A real Ctrl-C is also not covered: aborts are simulated by
-throwing. See `HANDOFF.md` for the on-server test checklist that covers the rest.
+throwing.
+
+## Verified on a real farm
+
+The script was run against a real CU on 2026-08-02: `SPSE-DEV`, July 2026 CU (KB5002882), taking
+build 16.0.19725.20280 → 16.0.19725.20434. Exit code **0**, and the service state afterwards was
+**identical to before across all seven services** — including `OSearch16` returning to `Manual`
+rather than being started as `Automatic`. The install took 8m51s. `Microsoft.SharePoint.dll` was
+confirmed at the new version, and PSConfig afterwards took `BuildVersion` to 16.0.19725.20434 with
+`NeedsUpgrade` false.
+
+Mid-run, all seven services were observed `Stopped` **and** `Disabled` simultaneously. That is the
+disable-before-stop ordering doing its job: 40 minutes earlier on the same box, `OSearch16` had been
+restarted by `SPSearchHostController` 8 seconds after a manual stop, and under the script it stayed
+down.
+
+### Still never tested anywhere
+
+- **A stopped service staying stopped, on a real farm.** It cannot be staged: SharePoint restarts its
+  own services within seconds (`SPSearchHostController` → `OSearch16` is the clearest case). Covered
+  off-farm only, where the fake farm stages a stopped `Manual` service directly.
+- **A service not installed on the server.** Needs a role that lacks one — a WFE without Search. The
+  test farm is single-server, so all seven services exist.
+- **The graceful distributed cache path against a real cache cluster.** The control flow is covered
+  off-farm, both the success path and the fallback, but every cmdlet in it is stubbed. Note that a
+  single-server farm is a degenerate test anyway: with one cache host there is no peer to hand the
+  cached data to.
+- **A real Ctrl-C**, and therefore whether `finally` runs on a Windows console control event. Every
+  abort tested so far is exception-based.
+- **Exit code 17022, and durations over an hour.** Impractical to force; covered off-farm.
+- **The 300s default timeout at its limit.** Nothing came close on a real run, so the default is
+  untested rather than proven. Time `OSearch16` and `SPTimerV4` on a busy production farm before
+  trusting it — too low turns a slow but healthy service into an aborted patch run.
+
+### About the test farm
+
+`SPSE-DEV` is a single-server farm with **local SQL**, which is why a VM snapshot is a complete
+rollback there — it captures the binaries and the databases together. On a farm with remote SQL, a
+snapshot of the SharePoint VM alone would not roll back the schema changes a CU makes. Do not assume
+the rollback story transfers.
+
+Two behaviours worth knowing before designing further on-farm tests:
+
+- SharePoint services are never "Automatic (Delayed Start)" — they are `Automatic` or `Manual`
+  according to the server role. `W3SVC` is the only service in the script's list that is IIS rather
+  than SharePoint, so it is the only realistic subject for that code path. Even then, PSConfig clears
+  the flag during an upgrade.
+- SharePoint actively restores its own services to the running state, which is why the script sets
+  startup type to `Disabled` *before* stopping anything. Never reorder that.
