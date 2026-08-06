@@ -53,6 +53,47 @@ if ($env:DCACHE_RUNNING -eq "1") {
     New-FakeService -Name "SPCache" -Status "Stopped" -StartMode "Disabled"
 }
 
+## $env:DCACHE_HOST decides what the farm says about this server's distributed cache role, which is
+## independent of whether the SPCache service happens to be running:
+##   online   - a provisioned, Online instance for this machine  -> a genuine cache host
+##   offline  - an instance for this machine which is not Online -> not usable, must be left alone
+##   ""       - no instance for this machine at all              -> not a cache host
+## An instance belonging to another server is always returned as well, so the filter has something to
+## reject rather than an empty farm to pass by default.
+function global:New-FakeServiceInstance {
+    param($ServerName, $Status, $InstanceName = "SPDistributedCacheService Name=SPCache")
+
+    ## the real Service property is an SPDistributedCacheService whose ToString carries the name, and
+    ## the script compares it as a string - so the stub has to stringify the same way
+    $service = [PSCustomObject]@{}
+    $service | Add-Member -MemberType ScriptMethod -Name ToString -Value ([scriptblock]::Create("'$InstanceName'")) -Force
+
+    return [PSCustomObject]@{
+        Service = $service
+        Server  = [PSCustomObject]@{ Name = $ServerName }
+        Status  = $Status
+    }
+}
+
+function global:Get-SPServiceInstance {
+    [CmdletBinding()] param()
+
+    Log "DCACHE GETINSTANCE"
+
+    if ($env:DCACHE_HOST -eq "throw") { throw "the farm is not reachable" }
+
+    ## an instance on a different server, and a search instance on this one: both have to be filtered out
+    $instances = @(
+        New-FakeServiceInstance -ServerName "SOMEOTHERSERVER" -Status "Online"
+        New-FakeServiceInstance -ServerName $env:COMPUTERNAME -Status "Online" -InstanceName "SPSearchServiceInstance"
+    )
+
+    if ($env:DCACHE_HOST -eq "online")  { $instances += New-FakeServiceInstance -ServerName $env:COMPUTERNAME -Status "Online" }
+    if ($env:DCACHE_HOST -eq "offline") { $instances += New-FakeServiceInstance -ServerName $env:COMPUTERNAME -Status "Disabled" }
+
+    return $instances
+}
+
 ## these run on a real SharePoint server, where the genuine cache cmdlets resolve and would act on the
 ## live farm. Shadowing them is what keeps the graceful path safe to exercise here.
 function global:Use-SPCacheCluster { Log "DCACHE USECLUSTER" }

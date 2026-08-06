@@ -51,7 +51,7 @@ function Check($label, $expected, $actual) {
 }
 
 function Invoke-Scenario {
-    param($Scenario, $InstallerExit = 0, $HangService = "", [string[]]$ExtraArgs = @(), $DCacheRunning = $false)
+    param($Scenario, $InstallerExit = 0, $HangService = "", [string[]]$ExtraArgs = @(), $DCacheRunning = $false, $DCacheHost = "")
 
     Remove-Item $log -ErrorAction SilentlyContinue
 
@@ -62,6 +62,7 @@ function Invoke-Scenario {
     ## always set, so that one scenario cannot leak state into the next
     $env:HANG_SERVICE = $HangService
     $env:DCACHE_RUNNING = $(if ($DCacheRunning) { "1" } else { "" })
+    $env:DCACHE_HOST = $DCacheHost
 
     $out = & $shell -NoProfile -ExecutionPolicy Bypass -File $patched -CULocation $fakeCU @ExtraArgs 2>&1
     $code = $LASTEXITCODE
@@ -148,25 +149,110 @@ Check "the installation still ran"                  $true  ($l -contains "LAUNCH
 Check "services were still restored"                $true  ($l -contains "SETMODE SPTimerV4 -> Automatic")
 
 # ---------------------------------------------------------------------------------------------
-Write-Host "`nScenario: graceful distributed cache shutdown"
-$r = Invoke-Scenario -Scenario "ok" -DCacheRunning $true -ExtraArgs @("-Force", "-ShouldGracefulStopDCache")
+# the graceful path is on by default, so this passes no switch at all
+Write-Host "`nScenario: graceful distributed cache shutdown on a real cache host"
+$r = Invoke-Scenario -Scenario "ok" -DCacheRunning $true -DCacheHost "online" -ExtraArgs @("-Force")
 $l = $r.Lines
 Check "exit code is 0"                              0      $r.ExitCode
-Check "the switch enabled the graceful path"        $true  ($l -contains "DCACHE STOP graceful=True timeout=300")
+Check "the graceful path is on by default"          $true  ($l -contains "DCACHE STOP graceful=True timeout=300")
+Check "the role was confirmed with the farm"        $true  ($l -contains "DCACHE GETINSTANCE")
+Check "the role was checked before anything ran"    $true  ((IndexOf $l "DCACHE GETINSTANCE") -lt (IndexOf $l "DCACHE USECLUSTER"))
 Check "the instance was unprovisioned"              $true  ($l -contains "DCACHE REMOVE")
 Check "the instance was provisioned again"          $true  ($l -contains "DCACHE ADD")
 Check "the cache was not stopped as a plain service" $false ($l -contains "STOP SPCache")
 Check "unprovision precedes disabling"              $true  ((IndexOf $l "DCACHE REMOVE") -lt (IndexOf $l "SETMODE SPCache -> Disabled"))
 
 # ---------------------------------------------------------------------------------------------
+# the v1.7 call site: passing the switch explicitly still means the same thing
+Write-Host "`nScenario: -ShouldGracefulStopDCache passed explicitly still works"
+$r = Invoke-Scenario -Scenario "ok" -DCacheRunning $true -DCacheHost "online" -ExtraArgs @("-Force", "-ShouldGracefulStopDCache")
+$l = $r.Lines
+Check "exit code is 0"                              0     $r.ExitCode
+Check "the graceful path still engaged"             $true ($l -contains "DCACHE REMOVE")
+Check "and the instance came back"                  $true ($l -contains "DCACHE ADD")
+
+# ---------------------------------------------------------------------------------------------
+# THE CASE THIS EXISTS FOR: the caching service is running, but the farm says this server is not a
+# distributed cache host. No distributed cache cmdlet may touch it.
+Write-Host "`nScenario: SPCache is running but this server is NOT a cache host"
+$r = Invoke-Scenario -Scenario "ok" -DCacheRunning $true -DCacheHost "" -ExtraArgs @("-Force")
+$l = $r.Lines
+Check "exit code is 0"                              0      $r.ExitCode
+Check "the farm was asked about the role"           $true  ($l -contains "DCACHE GETINSTANCE")
+Check "the cache cluster was never entered"         $false ($l -contains "DCACHE USECLUSTER")
+Check "Stop-SPDistributedCache... never ran"        0      (CountMatching $l "DCACHE STOP")
+Check "Remove-SPDistributedCache... never ran"      $false ($l -contains "DCACHE REMOVE")
+Check "Add-SPDistributedCache... never ran"         $false ($l -contains "DCACHE ADD")
+Check "it was stopped as a plain service"           $true  ($l -contains "STOP SPCache")
+Check "and restarted as a plain service"            $true  ($l -contains "START SPCache")
+Check "the operator was told why"                   $true  ($r.Output -match "does not host the distributed cache")
+
+# ---------------------------------------------------------------------------------------------
+# an instance exists for this server but is not Online - unprovisioning it is neither needed nor safe
+Write-Host "`nScenario: the cache service instance is registered but not Online"
+$r = Invoke-Scenario -Scenario "ok" -DCacheRunning $true -DCacheHost "offline" -ExtraArgs @("-Force")
+$l = $r.Lines
+Check "exit code is 0"                              0      $r.ExitCode
+Check "no distributed cache cmdlet ran"             0      (CountMatching $l "DCACHE (USECLUSTER|STOP|REMOVE|ADD)")
+Check "it was stopped as a plain service"           $true  ($l -contains "STOP SPCache")
+Check "the status is reported"                      $true  ($r.Output -match "is Disabled rather than Online")
+
+# ---------------------------------------------------------------------------------------------
+# the role check has to fail closed: an unreachable farm is not evidence that this is a cache host
+Write-Host "`nScenario: the farm cannot be reached for the role check"
+$r = Invoke-Scenario -Scenario "ok" -DCacheRunning $true -DCacheHost "throw" -ExtraArgs @("-Force")
+$l = $r.Lines
+Check "exit code is 0"                              0      $r.ExitCode
+Check "the run was not aborted"                     $true  ($l -contains "LAUNCH installer")
+Check "no distributed cache cmdlet ran"             0      (CountMatching $l "DCACHE (USECLUSTER|STOP|REMOVE|ADD)")
+Check "it fell back to a plain stop"                $true  ($l -contains "STOP SPCache")
+Check "the failure to confirm is reported"          $true  ($r.Output -match "could not be read")
+
+# ---------------------------------------------------------------------------------------------
+Write-Host "`nScenario: opting out with -NoGracefulStopDCache"
+$r = Invoke-Scenario -Scenario "ok" -DCacheRunning $true -DCacheHost "online" -ExtraArgs @("-Force", "-NoGracefulStopDCache")
+$l = $r.Lines
+Check "exit code is 0"                              0      $r.ExitCode
+Check "the farm was not consulted at all"           $false ($l -contains "DCACHE GETINSTANCE")
+Check "no distributed cache cmdlet ran"             0      (CountMatching $l "DCACHE (USECLUSTER|STOP|REMOVE|ADD)")
+Check "the cache was stopped outright"              $true  ($l -contains "STOP SPCache")
+Check "and restarted as a plain service"            $true  ($l -contains "START SPCache")
+Check "the data loss is spelled out beforehand"     $true  ($r.Output -match "the data held in that cache is lost")
+
+# ---------------------------------------------------------------------------------------------
 Write-Host "`nScenario: graceful shutdown fails and falls back"
-$r = Invoke-Scenario -Scenario "dcachefail" -DCacheRunning $true -ExtraArgs @("-Force", "-ShouldGracefulStopDCache")
+$r = Invoke-Scenario -Scenario "dcachefail" -DCacheRunning $true -DCacheHost "online" -ExtraArgs @("-Force")
 $l = $r.Lines
 Check "exit code is 0"                              0      $r.ExitCode
 Check "it fell back to a plain stop"                $true  ($l -contains "STOP SPCache")
 Check "the cache was restarted as a service"        $true  ($l -contains "START SPCache")
 Check "it did not try to provision the instance"    $false ($l -contains "DCACHE ADD")
 Check "the fallback was reported"                   $true  ($r.Output -match "fallback to non graceful stop")
+
+# ---------------------------------------------------------------------------------------------
+# the caching service is stopped last, so any abort in the stop loop happens with the cache instance
+# still provisioned. Add-SPDistributedCacheServiceInstance must not run against it.
+Write-Host "`nScenario: aborted before the cache was reached, on a cache host"
+$r = Invoke-Scenario -Scenario "ok" -HangService "SPTraceV4" -DCacheRunning $true -DCacheHost "online" -ExtraArgs @("-Force")
+$l = $r.Lines
+Check "exit code is 1"                              1      $r.ExitCode
+Check "the cache was never unprovisioned"           $false ($l -contains "DCACHE REMOVE")
+Check "so it was NOT provisioned on the way out"    $false ($l -contains "DCACHE ADD")
+Check "the cache service was left running"          $false ($l -contains "STOP SPCache")
+Check "every disabled service was restored"         (CountMatching $l "-> Disabled") (CountMatching $l "-> (Automatic|Manual)")
+
+# ---------------------------------------------------------------------------------------------
+# interrupted after the instance was unprovisioned: it cannot be provisioned again while the
+# installer is still running, so the operator has to be told what to run afterwards
+Write-Host "`nScenario: interrupted after the cache was unprovisioned"
+$r = Invoke-Scenario -Scenario "interrupted" -DCacheRunning $true -DCacheHost "online" -ExtraArgs @("-Force")
+$l = $r.Lines
+Check "exit code is 1"                              1      $r.ExitCode
+Check "the instance really was unprovisioned"       $true  ($l -contains "DCACHE REMOVE")
+Check "it was NOT provisioned mid-install"          $false ($l -contains "DCACHE ADD")
+Check "the cache startup type was restored"         $true  ($l -contains "SETMODE SPCache -> Automatic")
+Check "the operator is told not to start it"        $true  ($r.Output -match "Do NOT start SPCache by hand")
+Check "and what to run instead"                     $true  ($r.Output -match "run Add-SPDistributedCacheServiceInstance on this server")
 
 # ---------------------------------------------------------------------------------------------
 # the CU path is rejected as it is bound, so these run the script directly rather than a scenario

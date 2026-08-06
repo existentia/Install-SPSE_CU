@@ -46,6 +46,16 @@ The missing-cmdlet case passes an explicit cmdlet list instead of removing a stu
 a real SharePoint server, where `Get-Command` resolves the genuine cache cmdlets no matter what the
 stubs define.
 
+The distributed cache role check has its own block: `Test-IsDistributedCacheHost` says yes only to an
+`Online` instance registered against this machine, and no to every other answer — no instance, an
+instance that is `Disabled` or still provisioning, an instance belonging to another server, a
+different service instance on this one, and a farm that throws. It also checks, via the AST, that
+`Remove-SPDistributedCacheServiceInstance` is called from exactly one place and that the place is
+behind the role check. Alongside it, `Restore-ServiceState` is driven directly to prove that
+`Add-SPDistributedCacheServiceInstance` runs only for an instance this run unprovisioned, that the
+flag is cleared afterwards so a second restore cannot double-provision, and that nothing is
+provisioned while the installer is still running.
+
 It also covers the bounded waits — that a timeout returns `$false` while any other error is rethrown
 rather than swallowed, that the timeout reaches `WaitForStatus` as a `TimeSpan`, that a service which
 will not stop is reported as a failure, and, via the AST, that no unbounded `WaitForStatus` call can
@@ -53,17 +63,29 @@ be reintroduced.
 
 **`Test-Integration.ps1`** — runs the whole script end to end in a child process against a
 deliberately mixed fake farm (running Automatic services, one delayed-start service, a stopped
-Manual service, an already-Disabled service, and one service not installed at all). Eight scenarios:
-clean install, installer failure, launch failure, abort mid-install, a service which will not stop, an
-unattended `-Force` run, the graceful distributed cache path, and that path falling back when the
-graceful stop throws. Asserts disable-before-stop ordering, reverse restart order, delayed-start
-preservation, that a stopped service is never started, that an already-Disabled service is untouched,
-that a missing service is skipped silently, that the CU path is rejected at bind time with exit 1, and
-that startup types are restored down every failure path.
+Manual service, an already-Disabled service, and one service not installed at all). Fifteen
+scenarios: clean install, installer failure, launch failure, abort mid-install, a service which will
+not stop, an unattended `-Force` run, and then nine covering the distributed cache. Asserts
+disable-before-stop ordering, reverse restart order, delayed-start preservation, that a stopped
+service is never started, that an already-Disabled service is untouched, that a missing service is
+skipped silently, that the CU path is rejected at bind time with exit 1, and that startup types are
+restored down every failure path.
 
-Two environment variables drive the awkward scenarios: `$env:HANG_SERVICE` names a service whose
-`WaitForStatus` times out, and `$env:DCACHE_RUNNING` makes `SPCache` a running cache host so the
-graceful path engages.
+The cache scenarios are the point of the harness now that the graceful path is on by default. They
+cover a real cache host (no switch passed, proving the default), `-ShouldGracefulStopDCache` passed
+explicitly, `-NoGracefulStopDCache` opting out, the graceful stop throwing and falling back, and four
+ways of not being a cache host: no instance for this server, an instance that is not `Online`, an
+unreachable farm, and — the one this was built for — a **running** `SPCache` on a server the farm
+does not list as a cache host. Each asserts that no `DCACHE` cmdlet is logged at all. Two more assert
+the provisioning bookkeeping end to end: a run aborted before the cache is reached must not call
+`Add-`, and a run interrupted after the instance was unprovisioned must leave it unprovisioned and
+tell the operator what to run.
+
+Three environment variables drive the awkward scenarios: `$env:HANG_SERVICE` names a service whose
+`WaitForStatus` times out, `$env:DCACHE_RUNNING` makes the `SPCache` *service* running, and
+`$env:DCACHE_HOST` independently decides what the *farm* says about the role (`online`, `offline`,
+`throw`, or empty for no instance). Keeping those two separate is what lets the harness stage the
+service-running-but-not-a-cache-host case at all.
 
 ## Limits
 
@@ -96,6 +118,13 @@ down.
   off-farm, both the success path and the fallback, but every cmdlet in it is stubbed. Note that a
   single-server farm is a degenerate test anyway: with one cache host there is no peer to hand the
   cached data to.
+- **The role check against a real farm.** `Get-SPServiceInstance` is stubbed, so what is verified is
+  that the script asks the right question and does the right thing with each answer — not that a real
+  SPSE farm returns `SPDistributedCacheService Name=SPCache` and a `Server.Name` matching
+  `$env:COMPUTERNAME`. That instance name comes from Microsoft's documented procedure rather than from
+  this farm. **On a multi-server farm, run once on a non-cache-host with a transcript and confirm the
+  output says the server does not host the distributed cache** before trusting it across the farm.
+  The test farm is single-server, so it can only ever answer yes.
 - **A real Ctrl-C**, and therefore whether `finally` runs on a Windows console control event. Every
   abort tested so far is exception-based.
 - **Exit code 17022, and durations over an hour.** Impractical to force; covered off-farm.

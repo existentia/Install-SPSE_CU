@@ -61,8 +61,22 @@
           - validate -CULocation as it is bound rather than after the script has started, and resolve a
             relative path against the current file system location so that a current location on
             another provider, such as HKLM:\, cannot silently produce a nonsense path
+          - confirm through Get-SPServiceInstance that this server really is a distributed cache host
+            before running any distributed cache cmdlet against it. The SPCache service is installed on
+            every server in the farm and can be found running on a server whose service instance is not
+            provisioned, so the service status was never sufficient evidence of the role
+          - only provision the cache service instance again if this run was the one which unprovisioned
+            it. The caching service is stopped last, so any run abandoned in the stop loop previously
+            reached Add-SPDistributedCacheServiceInstance with the instance still provisioned
+          - tell the operator that the caching service is the one service not to start by hand if the
+            run is interrupted after its instance has been unprovisioned
           - BREAKING CHANGE: -ShouldGracefulStopDCache is now a switch. Call it as
             -ShouldGracefulStopDCache where version 1.6 and earlier needed -ShouldGracefulStopDCache $true
+          - BREAKING CHANGE: -ShouldGracefulStopDCache now defaults to on, because it can no longer
+            engage on a server which does not host the distributed cache. Opt out with the new
+            -NoGracefulStopDCache, which stops the caching service outright and loses the data held in
+            the cache. -ShouldGracefulStopDCache:$false does the same but does not survive
+            powershell.exe -File, where every argument arrives as a literal string
 
    Exit Codes:
     The script returns the exit code of the patch installer so that the outcome can be evaluated by
@@ -112,10 +126,21 @@ param (
     })]
     [string]$CULocation,
 
-    ## a switch, so the graceful shutdown is requested with -ShouldGracefulStopDCache. Version 1.6 and
-    ## earlier took a [bool] and had to be called with -ShouldGracefulStopDCache $true
+    ## on by default: the graceful shutdown is the procedure Microsoft documents for taking a cache host
+    ## down, and it now engages only where the server really is a distributed cache host - see
+    ## Test-IsDistributedCacheHost. Everywhere else it costs nothing because it never runs.
+    ## Version 1.6 and earlier took a [bool], defaulted to off, and had to be called with
+    ## -ShouldGracefulStopDCache $true
     [Parameter(Mandatory=$false)]
-    [switch]$ShouldGracefulStopDCache,
+    [switch]$ShouldGracefulStopDCache = $true,
+
+    ## the way to turn the graceful shutdown off. -ShouldGracefulStopDCache:$false also works, but only
+    ## when the script is dot sourced or called through powershell.exe -Command. Under
+    ## powershell.exe -File - which is how an unattended run across a farm is usually driven - every
+    ## argument arrives as a literal string, so :$false is the string "$false" and the bind fails
+    ## outright. This switch works under both. If both are given, this one wins
+    [Parameter(Mandatory=$false)]
+    [switch]$NoGracefulStopDCache,
 
     ## how long to wait for a single service to stop or start, and for the graceful shutdown of the
     ## distributed cache. Applies per service, not to the run as a whole
@@ -126,6 +151,13 @@ param (
     [Parameter(Mandatory=$false)]
     [switch]$Force
 )
+
+## the explicit opt out wins over the default, and over -ShouldGracefulStopDCache having been passed
+## as well. Everything downstream reads $ShouldGracefulStopDCache alone
+if ($NoGracefulStopDCache)
+{
+    $ShouldGracefulStopDCache = $false
+}
 
 ## the base for a relative path is taken from Get-Location -PSProvider FileSystem rather than $PWD, so
 ## that running with a current location on another provider - HKLM:\ for instance - cannot silently
@@ -222,6 +254,13 @@ function Get-ServiceState {
         StartMode        = $startMode
         DelayedStart     = $delayedStart
         StartModeChanged = $false
+
+        ## set only once this run has actually unprovisioned the distributed cache service instance on
+        ## this server, and cleared once it has been provisioned again. It records what was done rather
+        ## than what was asked for, which is what makes it safe for Restore-ServiceState to key on:
+        ## Add-SPDistributedCacheServiceInstance must never run against an instance this run did not
+        ## remove
+        Unprovisioned    = $false
     }
 }
 
@@ -330,6 +369,7 @@ function Test-DistributedCacheSupport {
     ## a machine where the real cmdlets are installed - the script itself always uses the default
     param(
         [string[]]$RequiredCmdlets = @(
+            "Get-SPServiceInstance"
             "Use-SPCacheCluster"
             "Get-SPCacheClusterHealth"
             "Stop-SPDistributedCacheServiceInstance"
@@ -345,6 +385,66 @@ function Test-DistributedCacheSupport {
             Write-Host -ForegroundColor Yellow "$cmdlet is not available on this server."
             return $false
         }
+    }
+
+    return $true
+}
+
+function Test-IsDistributedCacheHost {
+
+    ## the SPCache Windows service being installed and running is NOT the same thing as this server
+    ## being a distributed cache host. SharePoint installs the service on every server in the farm, and
+    ## it can be found running on a server whose service instance is not provisioned at all - the state
+    ## which produces the familiar "cacheHostInfo is null" error. Remove-SPDistributedCacheServiceInstance
+    ## and Add-SPDistributedCacheServiceInstance must not be run there, so the service status is not
+    ## trusted as a proxy for the role: the authoritative answer is the service instance registered for
+    ## this machine, queried the way Microsoft documents it.
+    ##
+    ## https://learn.microsoft.com/sharepoint/administration/manage-the-distributed-cache-service
+    ##
+    ## the instance name and computer name are parameters purely so that the off-farm tests can drive
+    ## both answers - the script itself always uses the defaults
+    param(
+        [string]$InstanceName = "SPDistributedCacheService Name=SPCache",
+        [string]$ComputerName = $env:COMPUTERNAME
+    )
+
+    if (!(Get-Command "Get-SPServiceInstance" -ErrorAction SilentlyContinue))
+    {
+        Write-Host -ForegroundColor Yellow "Get-SPServiceInstance is not available, so it cannot be confirmed that this server hosts the distributed cache."
+        return $false
+    }
+
+    ## a farm which cannot be reached is not evidence that this server is a cache host, so any failure
+    ## here answers no. The cost of a false no is a plain service stop; the cost of a false yes is
+    ## running the cache cmdlets against a server that does not host the cache
+    try
+    {
+        $instance = @(Get-SPServiceInstance -ErrorAction Stop |
+            Where-Object { "$($_.Service)" -eq $InstanceName -and "$($_.Server.Name)" -eq $ComputerName })
+    }
+    catch
+    {
+        $_ | Out-Host
+        Write-Host -ForegroundColor Yellow "The distributed cache service instances could not be read, so it cannot be confirmed that this server hosts the distributed cache."
+        return $false
+    }
+
+    if ($instance.Count -eq 0)
+    {
+        Write-Host "$ComputerName does not host the distributed cache, so the distributed cache cmdlets will not be run against it."
+        return $false
+    }
+
+    ## an instance which is registered but not Online is not serving cache, and unprovisioning it is
+    ## both unnecessary and liable to fail. Status is compared as a string so that the SPObjectStatus
+    ## enum does not have to be loaded
+    $status = "$($instance[0].Status)"
+
+    if ($status -ne "Online")
+    {
+        Write-Host -ForegroundColor Yellow "The distributed cache service instance on $ComputerName is $status rather than Online, so the distributed cache cmdlets will not be run against it."
+        return $false
     }
 
     return $true
@@ -370,6 +470,14 @@ function Stop-DistributedCacheGracefully {
             return $false
         }
 
+        ## a server which does not host the distributed cache is not a failure and is not reported as
+        ## one - the caching service is simply stopped and restarted like every other service in the list
+        if (!(Test-IsDistributedCacheHost))
+        {
+            Write-Host "The caching service will be stopped and restarted like any other service."
+            return $false
+        }
+
         Use-SPCacheCluster | Out-Host
         Get-SPCacheClusterHealth | Out-Host
 
@@ -392,7 +500,6 @@ function Stop-DistributedCacheGracefully {
 function Restore-ServiceState {
     param(
         [PSCustomObject[]]$ServiceStates,
-        [bool]$GracefulDCache = $false,
         [bool]$StartServices = $true,
         [int]$TimeoutSeconds = 300
     )
@@ -431,10 +538,18 @@ function Restore-ServiceState {
                 continue
             }
 
-            if ($state.Graceful -and $GracefulDCache)
+            ## only the instance this run unprovisioned is provisioned again. Keying on the request
+            ## rather than on what was done would call Add-SPDistributedCacheServiceInstance against a
+            ## still-provisioned instance whenever the run was abandoned before the cache was reached -
+            ## the caching service is the last one stopped, so that is every abort in the stop loop
+            if ($state.Unprovisioned)
             {
                 Write-Host "Add SPDistributedCacheServiceInstance"
                 Add-SPDistributedCacheServiceInstance | Out-Host
+
+                ## cleared for the same reason StartModeChanged is, so that this function can safely be
+                ## called more than once
+                $state.Unprovisioned = $false
                 continue
             }
 
@@ -496,6 +611,29 @@ foreach ($state in $servicesToDisable)
 
 Write-Host -ForegroundColor Yellow ""
 
+## the operator is told what the caching service is in for before confirming. Whether this server
+## actually hosts the distributed cache is established at the point of stopping it rather than here,
+## so that the farm is queried once, after the confirmation, and not at all on a server which is not
+## running the caching service
+$gracefulCandidate = @($ServiceStates | Where-Object { $_.Graceful -and $_.WasRunning })
+
+if ($gracefulCandidate.Count -gt 0)
+{
+    if ($ShouldGracefulStopDCache)
+    {
+        Write-Host -ForegroundColor Yellow "If this server hosts the distributed cache, its cached data will be handed to another host and"
+        Write-Host -ForegroundColor Yellow "the service instance will be unprovisioned and provisioned again once the patch is applied. If it"
+        Write-Host -ForegroundColor Yellow "does not host the distributed cache, $($gracefulCandidate[0].Name) is stopped and restarted like any other service."
+    }
+    else
+    {
+        Write-Host -ForegroundColor Yellow "The graceful shutdown was turned off, so $($gracefulCandidate[0].Name) will be stopped outright. If this server"
+        Write-Host -ForegroundColor Yellow "hosts the distributed cache, the data held in that cache is lost."
+    }
+
+    Write-Host -ForegroundColor Yellow ""
+}
+
 if ($Force)
 {
     Write-Host -ForegroundColor Yellow "-Force was specified, so the confirmation prompt is skipped."
@@ -523,10 +661,16 @@ try
         ## changed, because unprovisioning the service instance of a disabled service fails
         if ($useGracefulStop)
         {
-            if (!(Stop-DistributedCacheGracefully -State $state -TimeoutSeconds $ServiceTimeoutSeconds))
+            if (Stop-DistributedCacheGracefully -State $state -TimeoutSeconds $ServiceTimeoutSeconds)
             {
-                ## the graceful shutdown failed - fall back to simply stopping the service
-                $ShouldGracefulStopDCache = $false
+                ## the instance is now unprovisioned, so the finally block owes the farm an
+                ## Add-SPDistributedCacheServiceInstance
+                $state.Unprovisioned = $true
+            }
+            else
+            {
+                ## either this server does not host the distributed cache or the graceful shutdown
+                ## failed - fall back to simply stopping the service
                 $useGracefulStop = $false
             }
         }
@@ -635,10 +779,23 @@ finally
         Write-Host -ForegroundColor Red "The startup types will be restored but the services will NOT be started, because"
         Write-Host -ForegroundColor Red "starting them now would interfere with the installation which is still in progress."
         Write-Host -ForegroundColor Red "Start them manually once the installation has finished, or reboot the server."
+
+        ## the caching service is the one service which must not be started by hand. Its instance was
+        ## unprovisioned, and Microsoft is explicit that the only supported way to bring it back is
+        ## Add-SPDistributedCacheServiceInstance - starting the service directly leaves the farm with a
+        ## cache host SharePoint does not know about
+        foreach ($state in @($ServiceStates | Where-Object { $_.Unprovisioned }))
+        {
+            Write-Host -ForegroundColor Red ""
+            Write-Host -ForegroundColor Red "$($state.Name) is the exception: this server hosts the distributed cache and its service"
+            Write-Host -ForegroundColor Red "instance has been unprovisioned. Do NOT start $($state.Name) by hand. Once the installation has"
+            Write-Host -ForegroundColor Red "finished, run Add-SPDistributedCacheServiceInstance on this server instead."
+        }
+
         Write-Host
     }
 
-    Restore-ServiceState -ServiceStates $ServiceStates -GracefulDCache $ShouldGracefulStopDCache -StartServices (!$installerStillRunning) -TimeoutSeconds $ServiceTimeoutSeconds
+    Restore-ServiceState -ServiceStates $ServiceStates -StartServices (!$installerStillRunning) -TimeoutSeconds $ServiceTimeoutSeconds
 
     Write-Host
     Write-Host -ForegroundColor Green "Service restart completed."

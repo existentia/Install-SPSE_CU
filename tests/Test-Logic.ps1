@@ -104,6 +104,32 @@ Check "Boot drivers left alone"     $before $script:SetServiceCalls.Count
 Write-Host "`nStop-DistributedCacheGracefully (return value purity)"
 function Use-SPCacheCluster { "noise from Use-SPCacheCluster" }
 function Get-SPCacheClusterHealth { "noise from Get-SPCacheClusterHealth"; [PSCustomObject]@{ Health = "OK" } }
+
+## the farm's answer about this server's distributed cache role. $script:CacheInstanceStatus of $null
+## means no instance is registered for this machine at all
+$script:CacheInstanceStatus = "Online"
+function Get-SPServiceInstance {
+    [CmdletBinding()] param()
+
+    if ($script:CacheInstanceStatus -eq "throw") { throw "the farm is not reachable" }
+
+    ## the real Service property stringifies to the instance name, and an instance belonging to another
+    ## server is always present so that the filter has something to reject
+    $mk = {
+        param($ServerName, $Status, $Name = "SPDistributedCacheService Name=SPCache")
+        $svc = [PSCustomObject]@{}
+        $svc | Add-Member -MemberType ScriptMethod -Name ToString -Value ([scriptblock]::Create("'$Name'")) -Force
+        [PSCustomObject]@{ Service = $svc; Server = [PSCustomObject]@{ Name = $ServerName }; Status = $Status }
+    }
+
+    $instances = @((& $mk "SOMEOTHERSERVER" "Online"))
+
+    if ($null -ne $script:CacheInstanceStatus -and $script:CacheInstanceStatus -ne "throw") {
+        $instances += (& $mk $env:COMPUTERNAME $script:CacheInstanceStatus)
+    }
+
+    return $instances
+}
 function Stop-SPDistributedCacheServiceInstance { [CmdletBinding()] param([switch]$Graceful, [switch]$Force, $Timeout, $Identity) "noise from Stop-SPDistributedCacheServiceInstance" }
 function Remove-SPDistributedCacheServiceInstance { "noise from Remove-SPDistributedCacheServiceInstance" }
 function Add-SPDistributedCacheServiceInstance { "noise from Add-SPDistributedCacheServiceInstance" }
@@ -124,6 +150,98 @@ Write-Host "`nTest-DistributedCacheSupport"
 ## server, where Get-Command would find the genuine cmdlets no matter what the stubs do
 Check "all required cmdlets present -> true"  $true  (Test-DistributedCacheSupport)
 Check "a missing cmdlet -> false"             $false (Test-DistributedCacheSupport -RequiredCmdlets @("Get-Command", "Definitely-NotARealCmdlet"))
+
+## the role check needs it, and it is the cmdlet which decides whether anything else runs at all
+$requiredAst = $ast.Find({
+    $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $args[0].Name -eq "Test-DistributedCacheSupport" }, $true)
+Check "Get-SPServiceInstance is a prerequisite" $true ($requiredAst.Extent.Text -match "Get-SPServiceInstance")
+
+# ---- 3c. the role check: the cache cmdlets only ever run on a real cache host -------------------
+Write-Host "`nTest-IsDistributedCacheHost"
+
+## the SPCache service is installed on every server in the farm and can be found running on a server
+## whose instance is not provisioned, so only the farm's own answer counts
+$script:CacheInstanceStatus = "Online"
+Check "a provisioned Online instance -> true"    $true  (Test-IsDistributedCacheHost)
+
+$script:CacheInstanceStatus = $null
+Check "no instance for this server -> false"     $false (Test-IsDistributedCacheHost)
+
+$script:CacheInstanceStatus = "Disabled"
+Check "an instance which is not Online -> false" $false (Test-IsDistributedCacheHost)
+
+$script:CacheInstanceStatus = "Provisioning"
+Check "an instance still provisioning -> false"  $false (Test-IsDistributedCacheHost)
+
+## an unreachable farm is not evidence that this server is a cache host. Failing closed costs a plain
+## service stop; failing open runs Remove-SPDistributedCacheServiceInstance somewhere it must not
+$script:CacheInstanceStatus = "throw"
+Check "an unreachable farm -> false"             $false (Test-IsDistributedCacheHost)
+
+$script:CacheInstanceStatus = "Online"
+Check "an instance on another server only -> false" $false (Test-IsDistributedCacheHost -ComputerName "NOTTHISSERVER")
+Check "a different service instance -> false"    $false (Test-IsDistributedCacheHost -InstanceName "SPSearchServiceInstance")
+
+Check "the answer is a single clean boolean"     1      @(Test-IsDistributedCacheHost).Count
+
+## and the graceful path must consult it - not the service status
+$gracefulAst = $ast.Find({
+    $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $args[0].Name -eq "Stop-DistributedCacheGracefully" }, $true)
+Check "the graceful path checks the role"        $true ($gracefulAst.Extent.Text -match "Test-IsDistributedCacheHost")
+
+$removeCalls = @($ast.FindAll({
+    $args[0] -is [System.Management.Automation.Language.CommandAst] -and
+    $args[0].GetCommandName() -eq "Remove-SPDistributedCacheServiceInstance" }, $true))
+Check "Remove- is called from exactly one place" 1 $removeCalls.Count
+Check "and that place is the graceful path"      $true ($gracefulAst.Extent.Text -match "Remove-SPDistributedCacheServiceInstance")
+
+# ---- 3d. the instance is only provisioned again if this run unprovisioned it --------------------
+Write-Host "`nRestore-ServiceState and the cache instance"
+
+$script:AddCalls = 0
+function Add-SPDistributedCacheServiceInstance { $script:AddCalls++ }
+
+function New-CacheState {
+    param([bool]$Unprovisioned)
+
+    $svc = [PSCustomObject]@{ Name = "SPCache"; Status = "Stopped"; Started = $false }
+    $svc | Add-Member -MemberType ScriptMethod -Name Refresh       -Value { }
+    $svc | Add-Member -MemberType ScriptMethod -Name Start         -Value { $this.Started = $true; $this.Status = "Running" }
+    $svc | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value { param($Status, $Timeout) }
+
+    return [PSCustomObject]@{
+        Name = "SPCache"; Graceful = $true; Service = $svc; WasRunning = $true
+        StartMode = "Auto"; DelayedStart = $false; StartModeChanged = $false
+        Unprovisioned = $Unprovisioned
+    }
+}
+
+## the caching service is stopped last, so a run abandoned in the stop loop reaches the restore with
+## the instance still provisioned. Provisioning it again there would be acting on a cache host this
+## run never took down
+$state = New-CacheState -Unprovisioned $false
+Restore-ServiceState -ServiceStates @($state) -StartServices $true -TimeoutSeconds 5 | Out-Null
+Check "an instance we did not remove is not added" 0     $script:AddCalls
+Check "it is started as a plain service instead"   $true  $state.Service.Started
+
+$script:AddCalls = 0
+$state = New-CacheState -Unprovisioned $true
+Restore-ServiceState -ServiceStates @($state) -StartServices $true -TimeoutSeconds 5 | Out-Null
+Check "an instance we did remove is provisioned"   1      $script:AddCalls
+Check "and it is not also started by hand"         $false  $state.Service.Started
+Check "the flag is cleared so a second call is safe" $false $state.Unprovisioned
+
+Restore-ServiceState -ServiceStates @($state) -StartServices $true -TimeoutSeconds 5 | Out-Null
+Check "a second restore does not provision twice"  1      $script:AddCalls
+
+## mid-install the instance must not come back, because the services are not being started at all
+$script:AddCalls = 0
+$state = New-CacheState -Unprovisioned $true
+Restore-ServiceState -ServiceStates @($state) -StartServices $false -TimeoutSeconds 5 | Out-Null
+Check "not provisioned while the installer runs"   0      $script:AddCalls
+Check "and the debt is still recorded"             $true   $state.Unprovisioned
 
 ## the cache is driven entirely through the SharePoint cmdlets, which need no module import
 $invoked = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true) |
@@ -215,6 +333,12 @@ foreach ($p in $ast.ParamBlock.Parameters) { $declared[$p.Name.VariablePath.User
 Check "ShouldGracefulStopDCache is a switch" "SwitchParameter" $declared["ShouldGracefulStopDCache"].StaticType.Name
 Check "there is a Force switch"              "SwitchParameter" $declared["Force"].StaticType.Name
 Check "the timeout is an int"                "Int32"           $declared["ServiceTimeoutSeconds"].StaticType.Name
+
+## the graceful shutdown is on by default, and the opt out is a switch of its own because
+## -ShouldGracefulStopDCache:$false does not survive powershell.exe -File
+Check "the graceful shutdown defaults to on" '$true'           $declared["ShouldGracefulStopDCache"].DefaultValue.Extent.Text
+Check "there is a -File safe opt out"        "SwitchParameter" $declared["NoGracefulStopDCache"].StaticType.Name
+Check "the opt out defaults to off"          $null             $declared["NoGracefulStopDCache"].DefaultValue
 
 ## validating at bind time is what makes an unattended run fail immediately rather than start and stop
 $culocAttributes = @($declared["CULocation"].Attributes | ForEach-Object { $_.TypeName.Name })

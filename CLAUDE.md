@@ -41,8 +41,9 @@ the one `[Diagnostics.Process]::Start` call is textually replaced. Scratch files
   and SharePoint SE cmdlets are unsupported on 7. `Test-Integration.ps1` spawns `powershell.exe`, so
   it is Windows-only by design.
 - The script is `#Requires -RunAsAdministrator`.
-- The `-ShouldGracefulStopDCache $true` path only works from the SharePoint Management Shell (see
-  pending fix #2 — the script does not load the `Microsoft.SharePoint.PowerShell` snap-in itself).
+- The graceful distributed cache path does **not** need the SharePoint Management Shell. Every cmdlet
+  it uses comes from the `SharePointServer` module, which SPSE puts on `PSModulePath` and which loads
+  on demand — so the script imports nothing.
 
 ## Architecture
 
@@ -62,6 +63,19 @@ Invariants that are easy to break — preserve them:
   Service Control Manager recovery action can revive it mid-patch. `SPCache` on the graceful path is
   the sole exception: it is unprovisioned *before* being disabled, because unprovisioning a disabled
   service instance fails.
+- **The distributed cache cmdlets only run on a confirmed cache host.** `Test-IsDistributedCacheHost`
+  asks the farm — an `Online` `SPDistributedCacheService Name=SPCache` instance registered against
+  `$env:COMPUTERNAME` — and every other answer, including an unreachable farm, means no cache cmdlet
+  runs at all and `SPCache` is stopped like any other service. The service being installed or running
+  is **not** evidence of the role: SPSE installs it farm-wide and it can run with the instance
+  unprovisioned. The check must fail closed. `-ShouldGracefulStopDCache` defaults to on and only
+  became safe to default once this check existed; `-NoGracefulStopDCache` is the opt-out, and it
+  exists as its own switch because `-ShouldGracefulStopDCache:$false` does not survive
+  `powershell.exe -File`.
+- **`Add-SPDistributedCacheServiceInstance` is gated on `Unprovisioned`, not on intent.** The flag is
+  set only after a successful `Remove-`, and cleared on restore. `SPCache` is stopped last, so keying
+  the restore on the caller's request instead would provision an instance that was never removed on
+  every abort in the stop loop.
 - **Restore the original startup type, never a blanket `Automatic`.** A `Manual` service goes back to
   `Manual`. Startup type is read via `Get-CimInstance Win32_Service` rather than
   `ServiceController.StartType` because only the former exposes `DelayedAutoStart`; `Set-Service`
@@ -74,7 +88,9 @@ Invariants that are easy to break — preserve them:
   started.
 - **If the installer is still running when `finally` runs**, startup types are restored but services
   are **not** started — starting them would restore the file locks mid-patch. Restoring a stopped
-  service's startup type does not start it, so that half is always safe.
+  service's startup type does not start it, so that half is always safe. A cache instance
+  unprovisioned by that run stays unprovisioned; the operator is told to run
+  `Add-SPDistributedCacheServiceInstance` and specifically *not* to start `SPCache` by hand.
 - **Exit codes are the caller's contract.** `Exit $installExitCode` propagates the installer's code
   verbatim; 17022 ("installed, reboot required") is deliberately *not* flattened to 0. `1` means the
   path was invalid or the run was interrupted before the installer reported. Known codes are in
